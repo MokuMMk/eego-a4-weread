@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>eego A4 一键刷机</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #1a1d27; --border: #2a2e3a;
+    --text: #e4e6eb; --muted: #8b8fa3; --accent: #4c9aff;
+    --accent-hover: #3b8bef; --success: #2ecc71; --danger: #e74c3c;
+    --warning: #f39c12; --mono: 'Consolas','Monaco','Courier New',monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; padding: 20px;
+  }
+  .container { max-width: 720px; width: 100%; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin-bottom: 16px;
+  }
+  .card-title {
+    font-size: 0.9rem; font-weight: 600; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .card-title .num {
+    background: var(--accent); color: #fff; width: 22px; height: 22px;
+    border-radius: 50%; display: inline-flex; align-items: center;
+    justify-content: center; font-size: 0.75rem;
+  }
+  .btn {
+    padding: 10px 20px; border: none; border-radius: 6px;
+    font-size: 0.9rem; cursor: pointer; transition: all 0.2s;
+    font-family: inherit;
+  }
+  .btn-success { background: var(--success); color: #fff; }
+  .btn-success:hover { filter: brightness(1.1); }
+  .btn-success:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-outline {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+  }
+  .btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-sm { padding: 6px 12px; font-size: 0.8rem; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .console {
+    background: #0a0c12; border: 1px solid var(--border); border-radius: 5px;
+    padding: 12px; height: 240px; overflow-y: auto;
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .console .log-info { color: #aab; }
+  .console .log-success { color: var(--success); }
+  .console .log-error { color: var(--danger); }
+  .console .log-warn { color: var(--warning); }
+  .progress-wrap {
+    background: var(--bg); border-radius: 4px; height: 8px;
+    overflow: hidden; margin-top: 12px; display: none;
+  }
+  .progress-bar {
+    background: var(--accent); height: 100%; width: 0%;
+    transition: width 0.2s;
+  }
+  .status-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 0.72rem; font-weight: 600;
+  }
+  .status-disconnected { background: #3a3a3a; color: var(--muted); }
+  .status-connected { background: rgba(46,204,113,0.2); color: var(--success); }
+  .status-flashing { background: rgba(76,154,255,0.2); color: var(--accent); }
+  .hint { font-size: 0.75rem; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+  .alert {
+    padding: 10px 14px; border-radius: 6px; font-size: 0.82rem;
+    margin-bottom: 12px;
+  }
+  .alert-info {
+    background: rgba(76,154,255,0.1); border: 1px solid rgba(76,154,255,0.3);
+    color: var(--accent);
+  }
+  .alert-warning {
+    background: rgba(243,156,18,0.12); border: 1px solid rgba(243,156,18,0.4);
+    color: var(--warning); font-weight: 600;
+  }
+  .big-btn {
+    width: 100%; padding: 18px; font-size: 1.1rem; font-weight: 600;
+    border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>eego A4 一键刷机</h1>
+  <p class="subtitle">连接设备 → 自动下载最新固件并烧录，全程一键完成</p>
+
+  <div class="alert alert-warning">
+    ⚠ SD 卡必须放置字体！请将字体文件（.eefont / .bin）放置在 SD 卡根目录！建议使用 12px 大小的字体。<br>
+    只能连接 2.4G、WiFi 6 以下的网络！
+  </div>
+
+  <div class="alert alert-info">
+    仅支持 Chrome / Edge 89+ 浏览器。使用 USB 数据线连接设备，确保是数据线而非仅充电线。<br>
+    点击下方按钮，在弹出的窗口中选择设备串口，之后自动完成下载、烧录与重启。
+  </div>
+
+  <!-- 一键刷机 -->
+  <div class="card">
+    <div class="card-title"><span class="num">1</span> 一键刷机</div>
+    <button class="btn btn-success big-btn" id="btn-flash">连接设备并自动烧录</button>
+    <div class="row" style="margin-top:12px;">
+      <span class="status-badge status-disconnected" id="status">未连接</span>
+      <span style="color:var(--muted);font-size:0.78rem;" id="chip-info"></span>
+    </div>
+    <div class="progress-wrap" id="progress-wrap">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div class="hint" id="progress-text"></div>
+  </div>
+
+  <!-- 控制台 -->
+  <div class="card">
+    <div class="card-title">
+      <span class="num">2</span> 控制台
+      <button class="btn btn-outline btn-sm" id="btn-clear-log" style="margin-left:auto;">清屏</button>
+    </div>
+    <div class="console" id="console"></div>
+  </div>
+</div>
+
+<script type="module">
+import { ESPLoader, Transport, HardReset } from '/bundle.js';
+window.__esptool = { ESPLoader, Transport, HardReset };
+window.dispatchEvent(new Event('esptool-loaded'));
+</script>
+<script>
+window.addEventListener('esptool-loaded', () => initApp());
+// 兜底：3 秒后未加载则提示失败
+setTimeout(() => { if (!window.__esptool) { showLoadError(); } }, 3000);
+
+function showLoadError() {
+  const consoleEl = document.getElementById('console');
+  const log = (msg, level = 'info') => {
+    const span = document.createElement('span');
+    span.className = `log-${level}`;
+    span.textContent = msg;
+    consoleEl.appendChild(span);
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  };
+  log('✗ 烧录库加载失败', 'error');
+  log('请强制刷新页面（Ctrl+F5）或清除浏览器缓存后重试', 'warn');
+  log('如问题持续，可改用本地 idf.py flash 烧录', 'info');
+}
+
+function initApp() {
+const { ESPLoader, Transport } = window.__esptool;
+const ESPTOOL_LOADED = typeof ESPLoader === 'function';
+
+let port = null;
+let transport = null;
+let esploader = null;
+let busy = false;   // 一键流程进行中，防止重复触发
+
+const $ = id => document.getElementById(id);
+const consoleEl = $('console');
+const statusEl = $('status');
+const chipInfoEl = $('chip-info');
+
+function log(msg, level = 'info') {
+  const span = document.createElement('span');
+  span.className = `log-${level}`;
+  span.textContent = msg;
+  consoleEl.appendChild(span);
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = `status-badge ${cls}`;
+}
+
+function setProgress(pct, text) {
+  $('progress-wrap').style.display = pct > 0 ? 'block' : 'none';
+  $('progress-bar').style.width = pct + '%';
+  $('progress-text').textContent = text || '';
+}
+
+// 终端适配器
+const terminal = {
+  clean: () => { consoleEl.innerHTML = ''; },
+  writeLine: data => log(data),
+  write: data => {
+    const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+    if (text.includes('\r')) {
+      const lines = text.split('\r');
+      lines.forEach(line => { if (line) log(line); });
+    } else if (text.trim()) {
+      log(text);
+    }
+  }
+};
+
+// 检查 Web Serial API 支持
+if (!('serial' in navigator)) {
+  log('✗ 当前浏览器不支持 Web Serial API', 'error');
+  log('请使用 Chrome 89+ 或 Edge 89+ 浏览器', 'warn');
+  $('btn-flash').disabled = true;
+} else if (!ESPTOOL_LOADED) {
+  log('✗ 烧录库加载失败', 'error');
+  log('请强制刷新页面（Ctrl+F5）或清除浏览器缓存后重试', 'warn');
+  $('btn-flash').disabled = true;
+} else {
+  log('✓ 一键刷机工具已就绪', 'success');
+  log('点击「连接设备并自动烧录」，选择串口后自动完成全部操作');
+}
+
+// 清理可能残留的旧连接
+async function cleanupConnection() {
+  if (transport) {
+    try { await transport.disconnect(); } catch(_) {}
+    transport = null;
+  }
+  if (port) {
+    try {
+      if (port.readable) {
+        try {
+          const reader = port.readable.getReader();
+          reader.releaseLock();
+        } catch(_) {}
+      }
+      await port.close();
+    } catch(_) {}
+    port = null;
+  }
+  esploader = null;
+}
+
+// 从服务器下载预置固件（带时间戳参数绕开 CDN 缓存）
+async function downloadFirmware() {
+  const ts = Date.now();
+  const files = [
+    { url: `/firmware/bootloader.bin?v=${ts}`, addr: '0x0', name: 'bootloader.bin' },
+    { url: `/firmware/partition-table.bin?v=${ts}`, addr: '0x8000', name: 'partition-table.bin' },
+    { url: `/firmware/papers3-weread-eegoa4.bin?v=${ts}`, addr: '0x10000', name: 'papers3-weread-eegoa4.bin' },
+  ];
+
+  const result = [];
+  for (const f of files) {
+    try {
+      log(`正在下载 ${f.name}...`);
+      const resp = await fetch(f.url, { cache: 'no-store' });
+      if (!resp.ok) { log(`✗ ${f.name} 下载失败: ${resp.status}`, 'error'); continue; }
+      const buf = await resp.arrayBuffer();
+      result.push({ name: f.name, data: new Uint8Array(buf), address: f.addr, size: buf.byteLength });
+      log(`✓ ${f.name} (${(buf.byteLength/1024).toFixed(1)} KB)`, 'success');
+    } catch (e) {
+      log(`✗ ${f.name} 下载失败: ${e.message}`, 'error');
+    }
+  }
+  return result;
+}
+
+// 一键刷机：连接 → 下载 → 烧录 → 重启
+async function flashAll() {
+  if (busy) return;
+  busy = true;
+  $('btn-flash').disabled = true;
+  setProgress(0, '');
+
+  try {
+    // 1. 清理旧连接
+    await cleanupConnection();
+
+    // 2. 获取串口（优先已授权 ESP32 端口，否则弹窗选择）
+    setStatus('选择设备', 'status-flashing');
+    log('正在请求串口访问权限...');
+    const existingPorts = await navigator.serial.getPorts();
+    port = existingPorts.find(p => {
+      const info = p.getInfo();
+      return info.usbVendorId === 0x303a || info.usbProductId === 0x1001;
+    });
+    if (!port) {
+      port = await navigator.serial.requestPort();
+    } else {
+      log('使用已授权的 ESP32 端口');
+    }
+
+    // 3. 连接芯片
+    setStatus('连接中', 'status-flashing');
+    log('正在以 460800 波特率连接...');
+    transport = new Transport(port);
+    esploader = new ESPLoader({
+      transport: transport,
+      baudrate: 460800,
+      terminal: terminal
+    });
+    log('正在握手连接芯片...');
+    const chip = await esploader.main();
+    chipInfoEl.textContent = `芯片: ${chip}`;
+    log(`✓ 已连接 ${chip}`, 'success');
+    setStatus('已连接', 'status-connected');
+
+    // 4. 自动下载固件
+    setStatus('下载固件', 'status-flashing');
+    log('自动模式：下载最新固件...');
+    const firmware = await downloadFirmware();
+    if (firmware.length === 0) {
+      log('✗ 固件下载失败，无法烧录', 'error');
+      throw new Error('firmware download failed');
+    }
+
+    // 5. 自动烧录
+    setStatus('烧录中', 'status-flashing');
+    const totalBytes = firmware.reduce((s, f) => s + f.data.length, 0);
+    let flashedBytes = 0;
+
+    for (let i = 0; i < firmware.length; i++) {
+      const f = firmware[i];
+      log(`[${i+1}/${firmware.length}] 烧录 ${f.name} → 0x${f.address}`);
+      await esploader.writeFlash({
+        fileArray: [{ data: f.data, address: parseInt(f.address, 0) }],
+        flashSize: 'keep',
+        reportProgress: (fileIndex, written, total) => {
+          const overallPct = Math.round((flashedBytes + written) / totalBytes * 100);
+          setProgress(overallPct, `${f.name}: ${Math.round(written/total*100)}% (${(written/1024).toFixed(1)}/${(total/1024).toFixed(1)} KB)`);
+        },
+        compress: true,
+      });
+      flashedBytes += f.data.length;
+      log(`✓ ${f.name} 完成`, 'success');
+    }
+
+    setProgress(100, '烧录完成');
+    log('========== 全部烧录完成 ==========', 'success');
+
+    // 6. 硬重启
+    try {
+      log('正在重启设备...');
+      const { HardReset } = window.__esptool;
+      const reset = new HardReset(transport);
+      await reset.hardReset();
+      log('✓ 已发送重启指令', 'success');
+    } catch (e) {
+      log(`重启指令发送失败: ${e.message}`, 'warn');
+    }
+
+    log('设备应已自动重启', 'success');
+    log('如未重启：拔出USB线 → 长按关机键保持不动 → 插入USB线 → 3秒后松开关机键', 'warn');
+
+    setStatus('已完成', 'status-connected');
+  } catch (e) {
+    log(`✗ 操作失败: ${e.message}`, 'error');
+    setStatus('未连接', 'status-disconnected');
+    await cleanupConnection();
+  }
+
+  busy = false;
+  $('btn-flash').disabled = false;
+  setProgress(0, '');
+}
+
+$('btn-flash').addEventListener('click', () => flashAll());
+
+// 清屏
+$('btn-clear-log').addEventListener('click', () => {
+  consoleEl.innerHTML = '';
+});
+
+} // end initApp()
+</script>
+</body>
+</html>

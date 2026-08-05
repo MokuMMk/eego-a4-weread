@@ -1,0 +1,37 @@
+# --- IDE ---
+.vscode/
+.trae/
+.idea/
+
+# --- 编译产物 ---
+build/
+managed_components/
+dependencies.lock
+
+# --- 日志 ---
+*.log
+
+# --- 生成配置 ---
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# --- 固件产物 ---
+firmware/
+
+# --- 本地敏感文件 ---
+weread_cookies.json
+weread_login_qr.png
+
+# --- web_flasher 部署脚本（含服务器凭据，勿上传） ---
+web_flasher/*.py
+web_flasher/README.md
+# 保留网页（index.html / bundle.js / flasher.nginx.conf）
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- 系统 ---
+.DS_Store
