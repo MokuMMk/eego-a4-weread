@@ -8,6 +8,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
+#include <cstdint>
+
 namespace eego {
 
 enum class WifiState {
@@ -26,11 +28,11 @@ public:
     esp_err_t init();
 
     // 从 config.json 读取 wifi_list，扫描可见 AP，连第一个匹配的。
-    // 每个匹配 SSID 最多重试 3 次（每次超时 10s），全失败后进入离线模式。
+    // 每个匹配 SSID 最多重试 3 次（第一次 30s、后续 15s），全失败后进入离线模式。
     WifiState connectMulti();
 
-    // 连接指定 SSID/密码（阻塞，最多 10s）。成功后凭据自动保存到 NVS。
-    WifiState connect(const char* ssid, const char* password);
+    // 连接指定 SSID/密码（阻塞）。timeout_ms 为单次连接超时（含关联+握手+DHCP）。
+    WifiState connect(const char* ssid, const char* password, uint32_t timeout_ms = 15000);
 
     // 断开连接
     void disconnect();
@@ -40,6 +42,11 @@ public:
 
     // 后台静默重连（唤醒后调用，不弹 UI，不阻塞）
     void reconnectBackground();
+
+    // 后台自动重连节流：距上次尝试是否已超过 30s（离线/掉线时事件循环据此触发重连）
+    bool backgroundReconnectDue() const;
+    // 记录一次后台重连尝试时间（事件循环在触发重连后调用）
+    void markReconnectAttempt();
 
     // 状态查询
     WifiState state() const { return state_; }
@@ -58,6 +65,7 @@ private:
     WifiState state_ = WifiState::Disconnected;
     StateCallback callback_ = nullptr;
     bool initialized_ = false;
+    int64_t lastReconnectAt_ = 0;  // 上次后台自动重连尝试时间（毫秒）
 
     // 同步 connect() 等待事件用
     EventGroupHandle_t eventGroup_ = nullptr;

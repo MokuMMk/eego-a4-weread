@@ -95,6 +95,7 @@
 <div class="container">
   <h1>eego A4 一键刷机</h1>
   <p class="subtitle">连接设备 → 自动下载最新固件并烧录，全程一键完成</p>
+  <p class="subtitle" id="fw-time" style="margin-bottom:16px;"></p>
 
   <div class="alert alert-warning">
     ⚠ SD 卡必须放置字体！请将字体文件（.eefont / .bin）放置在 SD 卡根目录！建议使用 12px 大小的字体。<br>
@@ -215,6 +216,21 @@ if (!('serial' in navigator)) {
   log('✓ 一键刷机工具已就绪', 'success');
   log('点击「连接设备并自动烧录」，选择串口后自动完成全部操作');
 }
+
+// 获取固件上传时间
+fetch('/firmware/papers3-weread-eegoa4.bin', { method: 'HEAD', cache: 'no-store' })
+  .then(resp => {
+    const lm = resp.headers.get('Last-Modified');
+    if (lm) {
+      const d = new Date(lm);
+      const fwTimeEl = $('fw-time');
+      fwTimeEl.textContent = '固件更新时间：' + d.toLocaleString('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+      });
+    }
+  })
+  .catch(() => {});
 
 // 清理可能残留的旧连接
 async function cleanupConnection() {

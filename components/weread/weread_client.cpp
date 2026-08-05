@@ -519,6 +519,41 @@ HttpResponse WereadClient::postJson(const std::string& url, const std::string& j
     return request("POST", url, &jsonBody, referer, "application/json;charset=UTF-8");
 }
 
+// HEAD 请求：独立 client（不走 keep-alive 会话），用于异 host（如 flash.kever.ink）。
+// 只抓响应头（Last-Modified 等），不下载 body。headers map 使用小写 key。
+HttpResponse WereadClient::head(const std::string& url) {
+    HttpResponse resp;
+    RespBuf rb;
+    rb.body = &resp.body;
+    rb.headers = &resp.headers;
+    // HEAD 不会有 body，不需要 PSRAM 缓冲
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = url.c_str();
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.event_handler = http_event_handler;
+    cfg.user_data = &rb;
+    cfg.timeout_ms = HTTP_TIMEOUT_MS;
+    cfg.buffer_size = 4096;
+    cfg.buffer_size_tx = 2048;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) { resp.error = "init failed"; return resp; }
+
+    esp_http_client_set_method(client, HTTP_METHOD_HEAD);
+    esp_http_client_set_header(client, "User-Agent", WEREAD_USER_AGENT);
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        resp.status = esp_http_client_get_status_code(client);
+    } else {
+        resp.error = esp_err_to_name(err);
+        resp.status = -1;
+    }
+    esp_http_client_cleanup(client);
+    return resp;
+}
+
 // 续期：wr_skey 是短效令牌（几小时过期），用 wr_rt 调 renewal 换新；成功返回 true 并落盘
 bool WereadClient::tryRenew() {
     renewing_ = true; // 防 request 层对 renewal 响应再触发自动续期（递归）

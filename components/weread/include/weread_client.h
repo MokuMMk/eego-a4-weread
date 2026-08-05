@@ -66,6 +66,9 @@ public:
     HttpResponse postJson(const std::string& url, const std::string& jsonBody,
                           const std::string& referer = "https://weread.qq.com/");
 
+    // HEAD 请求（获取响应头，不下载 body）
+    HttpResponse head(const std::string& url);
+
     // 用 wr_rt 续期 wr_skey（短效令牌）；成功自动落盘
     bool tryRenew();
 

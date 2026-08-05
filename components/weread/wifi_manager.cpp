@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 
@@ -20,8 +21,9 @@ static const char* TAG = "eego.wifi";
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
-#define WIFI_CONNECT_TIMEOUT_MS  10000   // 单次连接超时
+#define WIFI_CONNECT_TIMEOUT_MS  15000   // 单次连接超时（含关联+握手+DHCP，弱信号下放宽）
 #define WIFI_MAX_RETRIES    3            // 每个 SSID 最多重试次数
+#define WIFI_RECONNECT_INTERVAL_MS 30000 // 离线/掉线后台自动重连的最小间隔
 
 WifiManager& WifiManager::instance() {
     static WifiManager inst;
@@ -136,7 +138,7 @@ void WifiManager::wifiEventHandler(void* arg, esp_event_base_t base,
     }
 }
 
-WifiState WifiManager::connect(const char* ssid, const char* password) {
+WifiState WifiManager::connect(const char* ssid, const char* password, uint32_t timeout_ms) {
     if (!initialized_) {
         if (init() != ESP_OK) {
             setState(WifiState::Failed);
@@ -146,6 +148,8 @@ WifiState WifiManager::connect(const char* ssid, const char* password) {
 
     // 清除残留连接与事件位
     esp_wifi_disconnect();
+    // 等底层完成断开，避免紧随其后的 esp_wifi_connect() 触发驱动竞态
+    vTaskDelay(pdMS_TO_TICKS(200));
     if (eventGroup_) {
         xEventGroupClearBits(eventGroup_, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     }
@@ -180,12 +184,12 @@ WifiState WifiManager::connect(const char* ssid, const char* password) {
         return state_;
     }
 
-    // 等待连接结果（最多 10s）
+    // 等待连接结果
     EventBits_t bits = xEventGroupWaitBits(
         eventGroup_,
         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+        pdMS_TO_TICKS(timeout_ms));
 
     connecting_ = false;
 
@@ -215,9 +219,6 @@ WifiState WifiManager::connectMulti() {
         }
     }
 
-    // 停止残留连接，避免扫描冲突
-    esp_wifi_disconnect();
-
     Config::instance().load();
     const AppConfig& cfg = Config::instance().get();
 
@@ -227,69 +228,75 @@ WifiState WifiManager::connectMulti() {
         return state_;
     }
 
-    // 扫描周边 AP（阻塞，约 1-2s）
+    // 停止残留连接，避免扫描冲突
+    // （在 wifiCount 检查之后执行：配网中 wifiCount==0 时不触碰 WiFi 状态，
+    //   避免后台自动重连任务在配网期间误断开正在进行的 STA 连接）
+    esp_wifi_disconnect();
+
+    // 扫描周边 AP（阻塞，约 1-2s）。仅用于提示/排序，不作为连接前置条件：
+    // 弱信号/干扰/隐藏网络常漏检，直接按名连接所有已配置 SSID 更可靠。
     wifi_scan_config_t scanCfg = {};
     scanCfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-    scanCfg.show_hidden = false;
+    scanCfg.show_hidden = true;  // 支持隐藏 SSID
     ESP_LOGI(TAG, "scanning APs...");
     esp_err_t err = esp_wifi_scan_start(&scanCfg, true);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "scan failed: %s, offline mode", esp_err_to_name(err));
-        setState(WifiState::OfflineMode);
-        return state_;
+        ESP_LOGW(TAG, "scan failed: %s, 继续按名直连", esp_err_to_name(err));
     }
 
     uint16_t apNum = 0;
-    if (esp_wifi_scan_get_ap_num(&apNum) != ESP_OK || apNum == 0) {
-        ESP_LOGW(TAG, "no AP found, offline mode");
-        setState(WifiState::OfflineMode);
-        return state_;
+    wifi_ap_record_t* aps = nullptr;
+    if (esp_wifi_scan_get_ap_num(&apNum) != ESP_OK) apNum = 0;
+    if (apNum > 0) {
+        aps = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * apNum);
+        if (aps && esp_wifi_scan_get_ap_records(&apNum, aps) != ESP_OK) {
+            free(aps); aps = nullptr; apNum = 0;
+        }
+        if (aps) {
+            ESP_LOGI(TAG, "found %u APs:", (unsigned)apNum);
+            for (int j = 0; j < apNum; j++) {
+                if (aps[j].ssid[0] == '\0') continue;
+                ESP_LOGI(TAG, "  AP[%d] %s rssi=%d", j,
+                         (const char*)aps[j].ssid, aps[j].rssi);
+            }
+        }
     }
-
-    wifi_ap_record_t* aps = (wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * apNum);
-    if (!aps) {
-        setState(WifiState::OfflineMode);
-        return state_;
-    }
-    if (esp_wifi_scan_get_ap_records(&apNum, aps) != ESP_OK) {
-        free(aps);
-        setState(WifiState::OfflineMode);
-        return state_;
-    }
-    ESP_LOGI(TAG, "found %u APs", (unsigned)apNum);
 
     bool anySuccess = false;
-    // 依次尝试 wifi_list 中可见的 SSID
+    // 依次直接尝试所有已配置 SSID（按名寻网，不依赖扫描结果）
     for (int i = 0; i < cfg.wifiCount && !anySuccess; i++) {
         const char* targetSsid = cfg.wifiList[i].ssid;
         if (targetSsid[0] == '\0') continue;
 
-        // 检查是否在扫描结果中
+        // 提示：该 SSID 是否在扫描结果中可见（仅诊断，不影响连接）
         bool visible = false;
-        for (int j = 0; j < apNum; j++) {
-            if (strcmp((const char*)aps[j].ssid, targetSsid) == 0) {
-                visible = true;
-                break;
+        if (aps) {
+            for (int j = 0; j < apNum; j++) {
+                if (strcmp((const char*)aps[j].ssid, targetSsid) == 0) {
+                    visible = true;
+                    break;
+                }
             }
         }
-        if (!visible) {
-            ESP_LOGI(TAG, "SSID not visible: %s", targetSsid);
-            continue;
-        }
+        ESP_LOGI(TAG, "尝试连接 %s (扫描可见=%d)", targetSsid, (int)visible);
 
-        // 最多重试 3 次
+        // 最多重试 3 次，第一次给 30s 容忍弱信号慢握手，后续 15s
         for (int retry = 0; retry < WIFI_MAX_RETRIES && !anySuccess; retry++) {
-            ESP_LOGI(TAG, "connecting %s (try %d/%d)",
-                     targetSsid, retry + 1, WIFI_MAX_RETRIES);
-            WifiState s = connect(targetSsid, cfg.wifiList[i].password);
+            uint32_t tmo = (retry == 0) ? 30000 : 15000;
+            ESP_LOGI(TAG, "connecting %s (try %d/%d, timeout=%lums)",
+                     targetSsid, retry + 1, WIFI_MAX_RETRIES, (unsigned long)tmo);
+            WifiState s = connect(targetSsid, cfg.wifiList[i].password, tmo);
             if (s == WifiState::Connected) {
+                ESP_LOGI(TAG, "连接成功 %s, reason=%d", targetSsid, (int)lastReason_);
                 anySuccess = true;
                 break;
             }
+            ESP_LOGW(TAG, "连接失败 %s (try %d/%d), reason=%d",
+                     targetSsid, retry + 1, WIFI_MAX_RETRIES, (int)lastReason_);
         }
     }
 
-    free(aps);
+    if (aps) free(aps);
 
     if (anySuccess) {
         return state_;  // Connected
@@ -316,6 +323,16 @@ void WifiManager::powerOff() {
     }
     setState(WifiState::Disconnected);
     ESP_LOGI(TAG, "wifi powered off");
+}
+
+void WifiManager::markReconnectAttempt() {
+    lastReconnectAt_ = esp_timer_get_time() / 1000;  // 毫秒
+}
+
+bool WifiManager::backgroundReconnectDue() const {
+    if (state_ == WifiState::Connected) return false;
+    int64_t nowMs = esp_timer_get_time() / 1000;
+    return (nowMs - lastReconnectAt_) >= WIFI_RECONNECT_INTERVAL_MS;
 }
 
 void WifiManager::reconnectBackground() {

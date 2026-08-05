@@ -16,6 +16,8 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_ota_ops.h"
+#include "esp_crt_bundle.h"
+#include "esp_http_client.h"
 #include "mbedtls/platform.h"
 
 #include <algorithm>
@@ -29,6 +31,11 @@
 #include "qrcodegen.h"
 
 static const char* TAG = "weread_app";
+
+// ---- OTA 升级常量 ----
+#define OTA_FIRMWARE_URL "https://flash.kever.ink/firmware/papers3-weread-eegoa4.bin"
+#define OTA_NVS_NAMESPACE "ota_info"
+#define OTA_NVS_KEY "fw_time"
 
 // ---- 屏幕几何常量 ----
 static constexpr int16_t SCR_W = 552;   // PortraitCanvas::WIDTH
@@ -157,6 +164,10 @@ void WereadApp::run() {
         }
     }
 
+    // 2.6 OTA: 确认当前固件有效（取消回滚）
+    esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "OTA: 当前固件已标记为有效");
+
     // 3. 初始化硬件
     initHardware();
 
@@ -218,6 +229,11 @@ void WereadApp::run() {
             [](void* arg) { static_cast<WereadApp*>(arg)->prefetchTaskFunc(); },
             "prefetch", 8192, this, 5, &prefetchTask_, 0);  // CPU0, 优先级5
     }
+
+    // 13b. 初始化后台 WiFi 自动重连任务（离线/掉线时周期尝试联网，不卡 UI）
+    xTaskCreatePinnedToCore(
+        [](void* arg) { static_cast<WereadApp*>(arg)->wifiReconnectTaskFunc(); },
+        "wifi_recon", 4096, this, 4, &wifiReconnectTask_, 0);  // CPU0, 低优先级
 
     // 14. 事件循环
     eventLoop();
@@ -389,8 +405,8 @@ void WereadApp::initLogin() {
 void WereadApp::initShelf() {
     if (offlineMode_) {
         // 离线模式：从缓存加载书架
-        // 100 条目 × 500B ≈ 50KB，必须放堆上（主任务栈仅 16~32KB，栈上会爆栈踩坏内存）
-        std::vector<ShelfEntry> entries(SHELF_PER_PAGE * 20);
+        // 204 条目 × 500B ≈ 100KB，必须放堆上（主任务栈仅 16~32KB，栈上会爆栈踩坏内存）
+        std::vector<ShelfEntry> entries(SHELF_PER_PAGE * 34);
         int n = Storage::instance().loadShelfCache(entries.data(), (int)entries.size());
         for (int i = 0; i < n; i++) {
             weread_api::BookEntry b;
@@ -419,8 +435,8 @@ void WereadApp::initShelf() {
         // 仍然失败 → 尝试缓存
         if (shelf_.empty()) {
             ESP_LOGW(TAG, "书架获取失败: %s，尝试缓存", err.c_str());
-            // 50KB 数组同样放堆上，避免爆主任务栈
-            std::vector<ShelfEntry> entries(SHELF_PER_PAGE * 20);
+            // 100KB 数组同样放堆上，避免爆主任务栈
+            std::vector<ShelfEntry> entries(SHELF_PER_PAGE * 34);
             int n = Storage::instance().loadShelfCache(entries.data(), (int)entries.size());
             for (int i = 0; i < n; i++) {
                 weread_api::BookEntry b;
@@ -434,10 +450,11 @@ void WereadApp::initShelf() {
             }
             offlineMode_ = true;
             if (shelf_.empty()) {
-                screenMsg("书架获取失败", err.c_str(), "点按屏幕重启");
+                // 书架拉取失败且缓存为空：允许用户退出到离线空书架，不再死等重启
+                screenMsg("书架获取失败", err.c_str(), "点按进入离线模式");
                 for (;;) {
                     TouchEvent evt = touch_->poll();
-                    if (evt.type == TouchEventType::Touch && evt.pressed) esp_restart();
+                    if (evt.type == TouchEventType::Touch && evt.pressed) break;
                     vTaskDelay(pdMS_TO_TICKS(50));
                 }
             }
@@ -529,6 +546,38 @@ void WereadApp::screenMsg(const char* l1, const char* l2, const char* l3) {
         if (l3 && l3[0]) FontManager::instance().drawText(*canvas_, PAD, 240, l3, 1, false);
     }
     canvas_->display(RefreshMode::Full);
+}
+
+// 可取消加载页：显示提示 + 底部"点按退出"小字，轮询触控/按键
+// 返回 true 表示用户取消，false 表示超时未取消
+bool WereadApp::screenMsgCancelable(const char* l1, const char* l2, const char* l3,
+                                    uint32_t timeoutMs) {
+    canvas_->clear();
+    if (FontManager::instance().uiLoaded()) {
+        FontManager::instance().drawText(*canvas_, PAD, 60, l1, 1, false);
+        if (l2 && l2[0]) FontManager::instance().drawText(*canvas_, PAD, 150, l2, 1, false);
+        if (l3 && l3[0]) FontManager::instance().drawText(*canvas_, PAD, 240, l3, 1, false);
+        // 底部小字提示
+        FontManager::instance().drawText(*canvas_, PAD, SCR_H - 40, "点按退出", 0, false);
+    }
+    canvas_->display(RefreshMode::Full);
+
+    // 轮询触控/按键，超时返回 false
+    uint32_t elapsed = 0;
+    const uint32_t step = 50;
+    while (elapsed < timeoutMs) {
+        TouchEvent evt = touch_->poll();
+        if (evt.type == TouchEventType::Touch && evt.pressed) {
+            return true;
+        }
+        ButtonEvent bevt;
+        if (ButtonManager::instance().poll(&bevt, 0)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(step));
+        elapsed += step;
+    }
+    return false;
 }
 
 // 延时期间检测触控，被触控打断返回 true
@@ -1159,17 +1208,17 @@ void WereadApp::openBookDetail(int shelfIdx) {
         screenMsg("加载详情...", curBook_.title.c_str());
         for (int i = 0; i < 2; i++) {
             if (weread_api::getBookDetail(curBook_.bookId, detail_, err)) break;
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (pollTouchDuringDelay(1000)) { renderBookshelf(false); return; }
         }
         for (int i = 0; i < 2; i++) {
             if (weread_api::getHotReviews(curBook_.bookId, reviews_, 2, err)) break;
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (pollTouchDuringDelay(1000)) { renderBookshelf(false); return; }
         }
     }
 
     if (!fetchToc(curBook_.bookId)) {
         screenMsg("目录获取失败", err.c_str());
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        if (pollTouchDuringDelay(2000)) { renderBookshelf(false); return; }
         renderBookshelf(false);
         return;
     }
@@ -1196,7 +1245,7 @@ bool WereadApp::fetchToc(const std::string& bookId) {
 
     // 1. 在线获取目录（3 次尝试）
     for (int attempt = 0; attempt < 3 && chapters_.empty(); attempt++) {
-        if (attempt) vTaskDelay(pdMS_TO_TICKS(1500 * attempt));
+        if (attempt && pollTouchDuringDelay(1500 * attempt)) return false;
         weread_api::getChapterInfos(bookId, chapters_, bookFormat_, err);
     }
 
@@ -1491,6 +1540,26 @@ void WereadApp::prefetchTaskFunc() {
             prefetch_.failedErr = err;  // 存储错误，供 openChapter 跳过冗余重试
         }
         prefetch_.loading = false;
+    }
+}
+
+// 后台自动重连：设备离线/掉线时，周期（30s）尝试联网，不阻塞 UI。
+// 已联网则跳过；connectMulti 阻塞在本任务内，不影响主线程渲染。
+void WereadApp::wifiReconnectTaskFunc() {
+    ESP_LOGI(TAG, "WiFi 自动重连任务启动");
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        WifiManager& wm = WifiManager::instance();
+        if (wm.isConnected()) continue;
+        if (!wm.backgroundReconnectDue()) continue;
+        wm.markReconnectAttempt();
+        ESP_LOGI(TAG, "后台自动重连...");
+        WifiState st = wm.connectMulti();
+        if (st == WifiState::Connected) {
+            ESP_LOGI(TAG, "后台自动重连成功");
+            wifiConnected_ = true;
+            offlineMode_ = false;
+        }
     }
 }
 
@@ -1849,7 +1918,7 @@ void WereadApp::renderSettings() {
     // 2. 标题 x=88 y=32 "设置" scale=1 加粗
     fm.drawText(*canvas_, 88, 36, "设置", 1, true);
 
-    // 3. 5个条目（每个 w=496 h=64 圆角16 灰底，无边框）
+    // 3. 6个条目（每个 w=496 h=64 圆角16 灰底，无边框）
     struct SettingItem {
         int16_t y;
         const char* mainText;
@@ -1861,10 +1930,11 @@ void WereadApp::renderSettings() {
         {180, "WiFi 重连", "用已保存配置重连",  false},
         {260, "WiFi 重置", "清除配置重新配网",  false},
         {340, "重置设备", "清空缓存与账号",     true},
-        {420, "返回主页", nullptr,             false},
+        {420, "检查更新", FW_VERSION,           false},
+        {500, "返回主页", nullptr,             false},
     };
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         auto& item = items[i];
         // 灰底圆角16（无边框）
         fillGrayRound(canvas_, 28, item.y, 496, 64, 16);
@@ -1882,14 +1952,14 @@ void WereadApp::renderSettings() {
         canvas_->drawIcon(488, item.y + 24, ICON_CHEVRON_RIGHT_16, 16, 16, BLACK);
     }
 
-    // 4. 底部提示 x=126 y=700 居中
+    // 4. 底部提示 x=126 y=730 居中
     const char* hint = settingsResetPending_
         ? "再次点击「重置设备」确认（5秒内）"
         : "恢复出厂设置需长按确认";
-    canvas_->drawTextCentered(126, 700, 300, hint, 1, false);
+    canvas_->drawTextCentered(126, 730, 300, hint, 1, false);
 
-    // 5. 版本号 x=126 y=670 居中（底部提示上方）
-    canvas_->drawTextCentered(126, 670, 300, "版本: beta2", 1, false);
+    // 5. 版本号 x=126 y=750 居中（底部提示下方）
+    canvas_->drawTextCentered(126, 750, 300, "版本: " FW_VERSION, 1, false);
 
     canvas_->display(RefreshMode::Full);
 }
@@ -2397,7 +2467,7 @@ void WereadApp::handleHomeTouch(int16_t x, int16_t y) {
             screenMsg("加载目录...", curBook_.title.c_str());
             if (!fetchToc(curBook_.bookId)) {
                 screenMsg("目录获取失败", curBook_.title.c_str());
-                vTaskDelay(pdMS_TO_TICKS(1500));
+                if (pollTouchDuringDelay(1500)) { renderHome(); return; }
                 renderHome();
                 return;
             }
@@ -2518,8 +2588,16 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         }
         return;
     }
-    // 条目5: 返回主页 (28, 420, 496, 64)
+    // 条目5: 检查更新 (28, 420, 496, 64)
     if (x >= 28 && x < 524 && y >= 420 && y < 484) {
+        ESP_LOGI(TAG, "设置 → 检查更新");
+        settingsResetPending_ = false;
+        checkOtaUpdate();
+        renderSettings();
+        return;
+    }
+    // 条目6: 返回主页 (28, 500, 496, 64)
+    if (x >= 28 && x < 524 && y >= 500 && y < 564) {
         settingsResetPending_ = false;
         navigateTo(ScreenId::Home);
         return;
@@ -2529,6 +2607,287 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         settingsResetPending_ = false;
         renderSettings();
     }
+}
+
+// ================================================================
+// OTA 升级
+// ================================================================
+
+// OTA 下载上下文（由 HTTP 事件回调写入到 OTA 分区）
+struct OtaDlCtx {
+    esp_ota_handle_t handle = 0;
+    int total_written = 0;
+    int content_length = 0;   // 来自 Content-Length 头；0=未知
+    int last_pct = -1;        // 上次显示的百分比
+    bool error = false;       // esp_ota_write 失败
+    bool cancel = false;      // 用户点击取消
+    Gslx680Touch* touch = nullptr;
+    PortraitCanvas* cv = nullptr;
+};
+
+// OTA 固件下载 HTTP 事件回调：把数据流式写入 OTA 分区，每 10% 刷新进度
+static esp_err_t otaHttpEventHandler_(esp_http_client_event_t* evt) {
+    OtaDlCtx* ctx = (OtaDlCtx*)evt->user_data;
+    if (!ctx) return ESP_OK;
+    switch (evt->event_id) {
+        case HTTP_EVENT_ON_DATA: {
+            if (ctx->error || ctx->cancel || evt->data_len <= 0) break;
+
+            // 检查用户是否点击取消
+            if (ctx->touch) {
+                TouchEvent tevt = ctx->touch->poll();
+                if (tevt.type == TouchEventType::Touch && tevt.pressed) {
+                    ctx->cancel = true;
+                    ESP_LOGI(TAG, "OTA: 用户取消下载");
+                    break;
+                }
+            }
+
+            esp_err_t w = esp_ota_write(ctx->handle, evt->data, evt->data_len);
+            if (w != ESP_OK) {
+                ESP_LOGE(TAG, "OTA: esp_ota_write 失败: %s", esp_err_to_name(w));
+                ctx->error = true;
+            } else {
+                ctx->total_written += evt->data_len;
+                // 首包拿到 Content-Length（chunked 传输返回 -1，跳过百分比）
+                if (ctx->content_length == 0) {
+                    int64_t cl = esp_http_client_get_content_length(evt->client);
+                    ctx->content_length = (cl > 0) ? (int)cl : 0;
+                }
+                if (ctx->content_length > 0 && ctx->cv &&
+                    FontManager::instance().uiLoaded()) {
+                    int pct = (ctx->total_written * 100) / ctx->content_length;
+                    if (pct >= ctx->last_pct + 10) {
+                        ctx->last_pct = pct;
+                        char buf[32];
+                        snprintf(buf, sizeof(buf), "下载中 %d%%", pct);
+                        ctx->cv->fillRect(0, SCR_H - 100, SCR_W, 100, WHITE);
+                        int tw = FontManager::instance().uiTextWidth(buf);
+                        FontManager::instance().drawText(*ctx->cv,
+                            (SCR_W - tw) / 2, SCR_H - 70, buf, 1, false);
+                        // 底部小字提示可取消
+                        const char* hint = "点按退出";
+                        int hw = FontManager::instance().uiTextWidth(hint);
+                        FontManager::instance().drawText(*ctx->cv,
+                            (SCR_W - hw) / 2, SCR_H - 40, hint, 0, false);
+                        ctx->cv->display(RefreshMode::Fast);
+                    }
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+// 设置页入口：HEAD 检查固件版本（Last-Modified），与 NVS 记录对比，提示确认后升级
+void WereadApp::checkOtaUpdate() {
+    ESP_LOGI(TAG, "OTA: 检查更新（当前版本 " FW_VERSION ")");
+
+    // 1. 离线模式无法检查
+    if (offlineMode_ || !wifiConnected_) {
+        screenMsg("需要联网检查更新", FW_VERSION, "请先连接 WiFi");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+
+    // 2. 检查中
+    screenMsg("检查更新中...", FW_VERSION);
+
+    // 3. HEAD 请求拿 Last-Modified
+    HttpResponse resp = WR.head(OTA_FIRMWARE_URL);
+    if (!resp.ok()) {
+        ESP_LOGW(TAG, "OTA: HEAD 失败 status=%d err=%s", resp.status, resp.error.c_str());
+        char l1[64];
+        snprintf(l1, sizeof(l1), "检查失败: %d", resp.status);
+        screenMsg(l1, resp.error.c_str());
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+
+    // 4. 解析 Last-Modified（headers map 为小写 key）
+    auto it = resp.headers.find("last-modified");
+    if (it == resp.headers.end() || it->second.empty()) {
+        ESP_LOGW(TAG, "OTA: 服务器未返回 Last-Modified");
+        screenMsg("已是最新版本", FW_VERSION);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+    const std::string& lastModified = it->second;
+    ESP_LOGI(TAG, "OTA: 服务器固件时间: %s", lastModified.c_str());
+
+    // 5. 读取已存储的 last-modified（上次成功升级的固件时间）
+    std::string stored;
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        char buf[128] = {0};
+        size_t len = sizeof(buf);
+        if (nvs_get_str(h, OTA_NVS_KEY, buf, &len) == ESP_OK) {
+            stored = buf;
+        }
+        nvs_close(h);
+    }
+
+    // 6. 相同 → 已是最新
+    if (!stored.empty() && stored == lastModified) {
+        ESP_LOGI(TAG, "OTA: 已是最新版本");
+        screenMsg("已是最新版本", FW_VERSION);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+
+    // 7. 发现新版本，提示确认
+    screenMsg("发现新版本", lastModified.c_str(), "点按确认更新");
+
+    // 8. 等待触控确认（30s 超时即取消）
+    uint32_t elapsed = 0;
+    const uint32_t step = 50;
+    bool confirmed = false;
+    while (elapsed < 30000) {
+        TouchEvent evt = touch_->poll();
+        if (evt.type == TouchEventType::Touch && evt.pressed) {
+            confirmed = true;
+            break;
+        }
+        ButtonEvent bevt;
+        if (ButtonManager::instance().poll(&bevt, 0)) {
+            confirmed = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(step));
+        elapsed += step;
+    }
+
+    if (!confirmed) {
+        ESP_LOGI(TAG, "OTA: 用户未确认（超时），取消更新");
+        return;
+    }
+
+    // 9. 执行升级（成功时内部重启，不会返回）
+    performOtaUpdate(OTA_FIRMWARE_URL, lastModified);
+}
+
+// 执行 OTA：下载固件 → 写入 OTA 分区 → 切换启动分区 → 重启
+bool WereadApp::performOtaUpdate(const std::string& firmwareUrl, const std::string& lastModified) {
+    ESP_LOGI(TAG, "OTA: 开始升级 %s", firmwareUrl.c_str());
+    screenMsg("准备升级...", "下载固件中");
+
+    // 1. 获取待写入分区
+    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
+    if (!update_part) {
+        ESP_LOGE(TAG, "OTA: 无法获取更新分区");
+        screenMsg("升级失败", "无可用 OTA 分区");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+    ESP_LOGI(TAG, "OTA: 写入分区 %s (0x%x bytes)", update_part->label, update_part->size);
+
+    // 2. 开始 OTA 写入（顺序写）
+    esp_ota_handle_t update_handle = 0;
+    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_begin 失败: %s", esp_err_to_name(err));
+        screenMsg("升级失败", "ota_begin 错误");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    // 3. 独立 HTTP client 下载固件（不走 WereadClient 会话，异 host）
+    OtaDlCtx ctx;
+    ctx.handle = update_handle;
+    ctx.cv = canvas_;
+    ctx.touch = touch_;
+
+    esp_http_client_config_t config = {};
+    config.url = firmwareUrl.c_str();
+    config.cert_pem = NULL;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.timeout_ms = 60000;
+    config.buffer_size = 1024;
+    config.buffer_size_tx = 1024;
+    config.event_handler = otaHttpEventHandler_;
+    config.user_data = &ctx;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "OTA: esp_http_client_init 失败");
+        esp_ota_abort(update_handle);
+        screenMsg("升级失败", "http init 错误");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    esp_err_t perf = esp_http_client_perform(client);
+    int status = (perf == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    int64_t got_len = (perf == ESP_OK) ? esp_http_client_get_content_length(client) : -1;
+    esp_http_client_cleanup(client);
+
+    ESP_LOGI(TAG, "OTA: 下载结果 perf=%s status=%d written=%d content-length=%lld err=%d",
+             esp_err_to_name(perf), status, ctx.total_written,
+             (long long)got_len, (int)ctx.error);
+
+    // 4. 用户取消
+    if (ctx.cancel) {
+        ESP_LOGI(TAG, "OTA: 用户已取消下载");
+        esp_ota_abort(update_handle);
+        screenMsg("已取消升级", "设备未受影响");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        return false;
+    }
+
+    // 5. 下载失败处理
+    if (perf != ESP_OK || status < 200 || status >= 300 || ctx.error) {
+        ESP_LOGE(TAG, "OTA: 下载失败");
+        esp_ota_abort(update_handle);
+        screenMsg("升级失败", "固件下载错误");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+    if (got_len > 0 && ctx.total_written < (int)got_len) {
+        ESP_LOGE(TAG, "OTA: 固件不完整 %d / %lld", ctx.total_written, (long long)got_len);
+        esp_ota_abort(update_handle);
+        screenMsg("升级失败", "固件不完整");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    // 5. 结束写入并校验
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_end 失败: %s", esp_err_to_name(err));
+        screenMsg("升级失败", "ota_end 错误");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    // 6. 切换启动分区
+    err = esp_ota_set_boot_partition(update_part);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
+        screenMsg("升级失败", "set_boot 错误");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "OTA: 升级完成，准备重启");
+    screenMsg("升级完成，重启中...");
+
+    // 7. 保存 last-modified 到 NVS（下次启动后据此判断是否最新）
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_str(h, OTA_NVS_KEY, lastModified.c_str()) == ESP_OK) {
+            nvs_commit(h);
+            ESP_LOGI(TAG, "OTA: last-modified 已保存到 NVS");
+        }
+        nvs_close(h);
+    }
+
+    // 8. 重启
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_restart();
+    return true;  // 不可达（esp_restart 不会返回）
 }
 
 // ================================================================

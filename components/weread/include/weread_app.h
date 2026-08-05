@@ -164,6 +164,10 @@ private:
     void triggerPrefetch();         // 触发预取（翻页接近章末时调用）
     bool tryConsumePrefetch(int chIdx);  // 尝试命中预取缓存
 
+    // ---- 后台自动重连 ----
+    TaskHandle_t wifiReconnectTask_ = nullptr;
+    void wifiReconnectTaskFunc();   // 离线/掉线时周期尝试联网（不卡 UI）
+
     // ---- 详情数据 ----
     weread_api::BookDetail detail_;
     std::vector<weread_api::Review> reviews_;
@@ -248,6 +252,10 @@ private:
     void handleHomeTouch(int16_t x, int16_t y);
     void handleSettingsTouch(int16_t x, int16_t y);
 
+    // ---- OTA 升级 ----
+    void checkOtaUpdate();      // 设置页入口：检查并执行 OTA
+    bool performOtaUpdate(const std::string& firmwareUrl, const std::string& lastModified);
+
     // ---- 事件循环 ----
     void eventLoop();
 
@@ -263,6 +271,10 @@ private:
     // ---- 工具 ----
     void drawCapsule(int x, int y, int w, bool selected);
     void screenMsg(const char* l1, const char* l2 = "", const char* l3 = "");
+    // 可取消加载页：显示提示 + 底部"点按退出"小字，轮询触控/按键
+    // 返回 true 表示用户取消，false 表示超时未取消
+    bool screenMsgCancelable(const char* l1, const char* l2 = "", const char* l3 = "",
+                             uint32_t timeoutMs = 30000);
     // 延时期间检测触控，被触控打断返回 true
     bool pollTouchDuringDelay(uint32_t ms);
     // 等待触控返回主页（超时后也返回主页，避免卡死）

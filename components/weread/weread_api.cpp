@@ -30,6 +30,10 @@
 // 其 include 路径优先级高于本组件。因此将我们的头文件重命名为 miniz_full.h 以避免冲突。
 #include "miniz_full.h"
 
+// 书架流式扫描上限：2400+ 本全量 cJSON 建树会撑爆 PSRAM，
+// 流式扫描只保留前 SHELF_MAX_BOOKS 本（与 initShelf 缓存容量匹配）。
+#define SHELF_MAX_BOOKS 200
+
 namespace weread_api {
 
 using eego::WR;
@@ -133,36 +137,296 @@ static int check_errcode(cJSON* root) {
 }
 
 // ---- 书架 ----
-bool getBookshelf(std::vector<BookEntry>& out, std::string& err) {
+//
+// 流式扫描相关辅助：在 PSRAM 大缓冲上就地解析，避免 cJSON 对 2400+ 本书
+// 全量建树导致内存溢出。扫描器只识别 books[] / bookProgress[] 顶层字段，
+// 不构造完整的 cJSON 树。
+
+// 在 [data,len) 中查找形如 "key":[ 的数组键，返回 [ 的位置，或 -1。
+// key_quoted 形如 "\"books\""。会跳过 "key" 之后非数组的同名键。
+static int find_array_key(const char* data, size_t len, const char* key_quoted) {
+    size_t klen = strlen(key_quoted);
+    size_t from = 0;
+    for (;;) {
+        int found = find_sub(data, len, from, key_quoted, klen);
+        if (found < 0) return -1;
+        size_t p = (size_t)found + klen;
+        while (p < len && (data[p]==' '||data[p]=='\t'||data[p]=='\n'||data[p]=='\r')) p++;
+        if (p < len && data[p] == ':') {
+            p++;
+            while (p < len && (data[p]==' '||data[p]=='\t'||data[p]=='\n'||data[p]=='\r')) p++;
+            if (p < len && data[p] == '[') return (int)p;
+        }
+        from = (size_t)found + klen;
+    }
+}
+
+// 从 obj_start（指向 '{'）查找匹配的 '}'，返回其位置；正确处理字符串内的括号与转义。
+static size_t find_matching_brace(const char* data, size_t len, size_t obj_start) {
+    if (obj_start >= len || data[obj_start] != '{') return (size_t)-1;
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (size_t i = obj_start; i < len; i++) {
+        char c = data[i];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') depth++;
+        else if (c == '}') { depth--; if (depth == 0) return i; }
+    }
+    return (size_t)-1;
+}
+
+// 从 val_pos（应指向开头的 "）读取 JSON 字符串值，返回解码后内容。
+// 处理 \" \\ \/ \n \t \r \b \f 及 \uXXXX（转 UTF-8）。
+static std::string extract_str_value(const char* data, size_t len, size_t val_pos) {
+    std::string out;
+    if (val_pos >= len || data[val_pos] != '"') return out;
+    size_t i = val_pos + 1;
+    while (i < len) {
+        char c = data[i];
+        if (c == '\\' && i + 1 < len) {
+            char n = data[i + 1];
+            switch (n) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'u': {
+                    if (i + 6 <= len) {
+                        char hex[5] = { data[i+2], data[i+3], data[i+4], data[i+5], 0 };
+                        unsigned cp = (unsigned)strtoul(hex, nullptr, 16);
+                        if (cp < 0x80) out += (char)cp;
+                        else if (cp < 0x800) {
+                            out += (char)(0xC0 | (cp >> 6));
+                            out += (char)(0x80 | (cp & 0x3F));
+                        } else {
+                            out += (char)(0xE0 | (cp >> 12));
+                            out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out += (char)(0x80 | (cp & 0x3F));
+                        }
+                        i += 6;
+                        continue;
+                    }
+                    out += n;
+                    break;
+                }
+                default: out += n; break;
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '"') break;
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+// 从 val_pos 读取 JSON 数字（支持负号、小数、指数），成功返回 true 并写出 double。
+static bool extract_num_value(const char* data, size_t len, size_t val_pos, double* out_num) {
+    if (val_pos >= len) return false;
+    size_t i = val_pos;
+    bool neg = false;
+    if (data[i] == '-') { neg = true; i++; }
+    if (i >= len || data[i] < '0' || data[i] > '9') return false;
+    double v = 0;
+    while (i < len && data[i] >= '0' && data[i] <= '9') { v = v * 10 + (data[i] - '0'); i++; }
+    if (i < len && data[i] == '.') {
+        i++;
+        double frac = 0, div = 1;
+        while (i < len && data[i] >= '0' && data[i] <= '9') { frac = frac * 10 + (data[i] - '0'); div *= 10; i++; }
+        v += frac / div;
+    }
+    if (i < len && (data[i] == 'e' || data[i] == 'E')) {
+        i++;
+        bool eneg = false;
+        if (i < len && data[i] == '-') { eneg = true; i++; }
+        else if (i < len && data[i] == '+') i++;
+        double e = 0;
+        while (i < len && data[i] >= '0' && data[i] <= '9') { e = e * 10 + (data[i] - '0'); i++; }
+        double m = 1;
+        for (int k = 0; k < (int)e; k++) m *= 10;
+        v *= eneg ? (1.0 / m) : m;
+    }
+    if (neg) v = -v;
+    if (out_num) *out_num = v;
+    return true;
+}
+
+// 扫描对象 [obj_start, obj_end] 范围内的顶层字段（depth==1），
+// 对每个 "key": value 调用 cb(key_ptr, key_len, val_pos)，val_pos 指向 value 首字符。
+// 正确跳过字符串值与嵌套对象/数组，避免误把值里的内容当成键。
+template <typename Cb>
+static void scan_object_fields(const char* data, size_t len,
+                               size_t obj_start, size_t obj_end, Cb cb) {
+    size_t i = obj_start + 1;
+    int depth = 1;
+    bool in_str = false, esc = false;
+    while (i < obj_end && depth > 0) {
+        char c = data[i];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            i++;
+            continue;
+        }
+        if (c == '"') {
+            // 读取键名（到下一个未转义的 "）
+            size_t key_start = i + 1;
+            size_t j = key_start;
+            while (j < obj_end) {
+                if (data[j] == '\\') { j += 2; continue; }
+                if (data[j] == '"') break;
+                j++;
+            }
+            size_t key_len = j - key_start;
+            i = (j < obj_end) ? j + 1 : j;  // 跳过闭合 "
+            while (i < obj_end && (data[i]==' '||data[i]=='\t'||data[i]=='\n'||data[i]=='\r')) i++;
+            if (i < obj_end && data[i] == ':') {
+                i++;
+                while (i < obj_end && (data[i]==' '||data[i]=='\t'||data[i]=='\n'||data[i]=='\r')) i++;
+                size_t val_pos = i;
+                if (depth == 1) cb(data + key_start, key_len, val_pos);
+                // 若值为字符串，进入字符串状态以正确跳过其内容
+                if (i < obj_end && data[i] == '"') { in_str = true; i++; }
+            }
+            continue;
+        }
+        if (c == '{' || c == '[') { depth++; i++; continue; }
+        if (c == '}' || c == ']') { depth--; i++; continue; }
+        i++;
+    }
+}
+
+// 流式扫描书架响应：在原始缓冲上就地解析 books[] 与 bookProgress[]。
+// 成功返回 true；找不到 books 或 bookProgress 数组、或解析出 0 本时返回 false
+// （调用方回退到 cJSON）。
+static bool parseBookshelfStream(const char* data, size_t len, std::vector<BookEntry>& out) {
     out.clear();
+    if (!data || len < 16) return false;
 
-    HttpResponse r;
-    int attempt = 0;
-    for (; attempt < 2; attempt++) {
-        r = WR.get(std::string(WEREAD_HOST_WEB) + "/web/shelf/sync");
-        if (!r.ok()) {
-            err = "shelf/sync HTTP " + std::to_string(r.status) + " " + r.error;
-            debug_log("shelf HTTP 失败: " + err);
-            return false;
+    // 1. 定位 "books":[
+    int books_arr = find_array_key(data, len, "\"books\"");
+    if (books_arr < 0) return false;
+    size_t p = (size_t)books_arr + 1;  // 跳过 [
+
+    out.reserve(64);
+
+    // 2. 遍历 books[] 中每个对象，最多 SHELF_MAX_BOOKS 本
+    while (p < len && out.size() < (size_t)SHELF_MAX_BOOKS) {
+        while (p < len) {
+            char c = data[p];
+            if (c==' '||c=='\t'||c=='\n'||c=='\r'||c==',') { p++; continue; }
+            break;
         }
-        ESP_LOGI(TAG, "shelf 接收 len=%d (psram=%s) head=%.120s",
-                 (int)r.length(), r.psbody ? "是" : "否", r.data());
-        if (r.length() > 100) {
-            ESP_LOGI(TAG, "shelf tail=%.100s", r.data() + r.length() - 100);
-        }
-        if (json_tail_complete(r)) break;
-        ESP_LOGW(TAG, "shelf 响应不完整（第 %d 次）%s", attempt + 1, attempt ? "" : "，重试一次");
-    }
-    if (!json_tail_complete(r)) {
-        err = "shelf JSON 解析失败: IncompleteInput";
-        shelf_debug_dump(r, err);
-        return false;
+        if (p >= len) break;
+        if (data[p] == ']') break;       // 数组结束
+        if (data[p] != '{') { p++; continue; }
+        size_t obj_start = p;
+        size_t obj_end = find_matching_brace(data, len, obj_start);
+        if (obj_end == (size_t)-1) return false;
+
+        BookEntry be;
+        scan_object_fields(data, len, obj_start, obj_end, [&](const char* key, size_t klen, size_t val_pos) {
+            if (klen == 6 && memcmp(key, "bookId", 6) == 0)
+                be.bookId = extract_str_value(data, len, val_pos);
+            else if (klen == 5 && memcmp(key, "title", 5) == 0)
+                be.title = extract_str_value(data, len, val_pos);
+            else if (klen == 6 && memcmp(key, "author", 6) == 0)
+                be.author = extract_str_value(data, len, val_pos);
+            else if (klen == 5 && memcmp(key, "cover", 5) == 0)
+                be.cover = extract_str_value(data, len, val_pos);
+            else if (klen == 6 && memcmp(key, "format", 6) == 0)
+                be.format = extract_str_value(data, len, val_pos);
+        });
+        if (!be.bookId.empty()) out.push_back(std::move(be));
+        p = obj_end + 1;
     }
 
-    cJSON* root = cJSON_ParseWithLength(r.data(), r.length());
+    if (out.empty()) return false;
+
+    // 3. 定位 "bookProgress":[ 并合并进度
+    int bp_arr = find_array_key(data, len, "\"bookProgress\"");
+    if (bp_arr < 0) return false;  // 找不到 bookProgress → 回退 cJSON
+    size_t q = (size_t)bp_arr + 1;  // 跳过 [
+
+    size_t remaining = out.size();
+    std::vector<char> matched(out.size(), 0);
+
+    while (q < len && remaining > 0) {
+        while (q < len) {
+            char c = data[q];
+            if (c==' '||c=='\t'||c=='\n'||c=='\r'||c==',') { q++; continue; }
+            break;
+        }
+        if (q >= len) break;
+        if (data[q] == ']') break;
+        if (data[q] != '{') { q++; continue; }
+        size_t obj_start = q;
+        size_t obj_end = find_matching_brace(data, len, obj_start);
+        if (obj_end == (size_t)-1) break;
+
+        std::string bid;
+        int progress = 0;
+        std::string chapterUid;
+        uint32_t updateTime = 0;
+        scan_object_fields(data, len, obj_start, obj_end, [&](const char* key, size_t klen, size_t val_pos) {
+            if (klen == 6 && memcmp(key, "bookId", 6) == 0) {
+                bid = extract_str_value(data, len, val_pos);
+            } else if (klen == 8 && memcmp(key, "progress", 8) == 0) {
+                double dv;
+                if (extract_num_value(data, len, val_pos, &dv)) progress = (int)dv;
+            } else if (klen == 10 && memcmp(key, "chapterUid", 10) == 0) {
+                if (val_pos < len && data[val_pos] == '"')
+                    chapterUid = extract_str_value(data, len, val_pos);
+                else {
+                    double dv;
+                    if (extract_num_value(data, len, val_pos, &dv))
+                        chapterUid = std::to_string((long long)dv);
+                }
+            } else if (klen == 10 && memcmp(key, "updateTime", 10) == 0) {
+                double dv;
+                if (extract_num_value(data, len, val_pos, &dv)) updateTime = (uint32_t)dv;
+            }
+        });
+
+        if (!bid.empty()) {
+            for (size_t k = 0; k < out.size(); k++) {
+                if (!matched[k] && out[k].bookId == bid) {
+                    out[k].progress = progress;
+                    out[k].progressChapterUid = chapterUid;
+                    out[k].readUpdateTime = updateTime;
+                    matched[k] = 1;
+                    if (remaining > 0) remaining--;
+                    break;
+                }
+            }
+        }
+        q = obj_end + 1;
+    }
+
+    return true;
+}
+
+// cJSON 全量解析（流式失败时的回退路径，保留原始实现）。
+static bool parseBookshelfCjson(const char* data, size_t len, std::vector<BookEntry>& out, std::string& err) {
+    cJSON* root = cJSON_ParseWithLength(data, len);
     if (!root) {
         err = "shelf JSON 解析失败";
-        shelf_debug_dump(r, err);
+        ESP_LOGE(TAG, "shelf cJSON_Parse 失败: len=%d free_heap=%lu free_psram=%lu",
+                 (int)len,
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         return false;
     }
 
@@ -213,6 +477,68 @@ bool getBookshelf(std::vector<BookEntry>& out, std::string& err) {
     cJSON_Delete(root);
     if (out.empty()) { err = "书架为空或解析无 books"; return false; }
     return true;
+}
+
+bool getBookshelf(std::vector<BookEntry>& out, std::string& err) {
+    out.clear();
+
+    HttpResponse r;
+    int attempt = 0;
+    for (; attempt < 4; attempt++) {
+        if (attempt) {
+            ESP_LOGI(TAG, "shelf 重试 %d/4，等待 500ms", attempt + 1);
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        r = WR.get(std::string(WEREAD_HOST_WEB) + "/web/shelf/sync");
+        if (!r.ok()) {
+            err = "shelf/sync HTTP " + std::to_string(r.status) + " " + r.error;
+            ESP_LOGW(TAG, "shelf HTTP 失败(try %d/4): %s", attempt + 1, err.c_str());
+            continue;  // HTTP 级失败也重试，不直接返回
+        }
+        ESP_LOGI(TAG, "shelf 接收 len=%d (psram=%s) head=%.120s",
+                 (int)r.length(), r.psbody ? "是" : "否", r.data());
+        if (r.length() > 100) {
+            ESP_LOGI(TAG, "shelf tail=%.100s", r.data() + r.length() - 100);
+        }
+        if (json_tail_complete(r)) break;
+        ESP_LOGW(TAG, "shelf 响应不完整（第 %d 次）", attempt + 1);
+    }
+    if (!r.ok()) {
+        // 所有 HTTP 尝试都失败
+        shelf_debug_dump(r, err);
+        return false;
+    }
+    if (!json_tail_complete(r)) {
+        err = "shelf JSON 解析失败: IncompleteInput";
+        ESP_LOGE(TAG, "shelf 4次重试仍不完整: len=%d free_heap=%lu free_psram=%lu",
+                 (int)r.length(),
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        shelf_debug_dump(r, err);
+        return false;
+    }
+
+    // 优先流式扫描（避免 cJSON 对 2400+ 本书全量建树导致 PSRAM 溢出）
+    if (parseBookshelfStream(r.data(), r.length(), out)) {
+        ESP_LOGI(TAG, "shelf 流式解析 books=%d (cap=%d) free_heap=%lu free_psram=%lu",
+                 (int)out.size(), (int)SHELF_MAX_BOOKS,
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        std::stable_sort(out.begin(), out.end(),
+            [](const BookEntry& a, const BookEntry& b) { return a.readUpdateTime > b.readUpdateTime; });
+        return true;
+    }
+
+    // 回退：cJSON 全量解析
+    ESP_LOGW(TAG, "shelf 流式解析失败，回退 cJSON: len=%d", (int)r.length());
+    out.clear();
+    if (parseBookshelfCjson(r.data(), r.length(), out, err)) {
+        std::stable_sort(out.begin(), out.end(),
+            [](const BookEntry& a, const BookEntry& b) { return a.readUpdateTime > b.readUpdateTime; });
+        return true;
+    }
+    shelf_debug_dump(r, err);
+    return false;
 }
 
 // ---- 书籍信息 ----
