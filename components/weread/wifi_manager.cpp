@@ -138,7 +138,8 @@ void WifiManager::wifiEventHandler(void* arg, esp_event_base_t base,
     }
 }
 
-WifiState WifiManager::connect(const char* ssid, const char* password, uint32_t timeout_ms) {
+WifiState WifiManager::connect(const char* ssid, const char* password, uint32_t timeout_ms,
+                               const uint8_t* bssid, int channel) {
     if (!initialized_) {
         if (init() != ESP_OK) {
             setState(WifiState::Failed);
@@ -160,8 +161,18 @@ WifiState WifiManager::connect(const char* ssid, const char* password, uint32_t 
     if (password) {
         strncpy((char*)cfg.sta.password, password, sizeof(cfg.sta.password) - 1);
     }
-    // 兼容开放网络与 WPA2/WPA3，使用最低阈值 OPEN，让驱动协商
-    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    // 认证阈值设为 WPA_PSK：接受 WPA / WPA2 / WPA3 及 TKIP / AES 等常用加密，
+    // 而非仅限 WPA2，扩大对不同路由器协议的兼容。
+    // 注意：阈值不是上层开关，不能设为 OPEN（会限制 STA 只能连开放网络）。
+    cfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
+
+    // 同名多 AP/mesh 场景：固定到扫描到的最强 BSSID 与信道，
+    // 避免 esp_wifi_connect() 因信道/AP 歧义导致认证超时(reason=2)。
+    if (bssid && channel > 0 && channel < 15) {
+        memcpy(cfg.sta.bssid, bssid, 6);
+        cfg.sta.bssid_set = true;
+        cfg.sta.channel = (uint8_t)channel;
+    }
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK) {
@@ -256,8 +267,9 @@ WifiState WifiManager::connectMulti() {
             ESP_LOGI(TAG, "found %u APs:", (unsigned)apNum);
             for (int j = 0; j < apNum; j++) {
                 if (aps[j].ssid[0] == '\0') continue;
-                ESP_LOGI(TAG, "  AP[%d] %s rssi=%d", j,
-                         (const char*)aps[j].ssid, aps[j].rssi);
+                ESP_LOGI(TAG, "  AP[%d] %s rssi=%d ch=%d auth=%d", j,
+                         (const char*)aps[j].ssid, aps[j].rssi, aps[j].primary,
+                         (unsigned)aps[j].authmode);
             }
         }
     }
@@ -280,6 +292,10 @@ WifiState WifiManager::connectMulti() {
         }
         ESP_LOGI(TAG, "尝试连接 %s (扫描可见=%d)", targetSsid, (int)visible);
 
+        // 按名直连，不固定最强 BSSID/信道。
+        // 与配网页(provision_portal)的连接方式保持一致，该路径已验证可用；
+        // 访客网络/虚拟多 BSSID 场景下固定到单个 BSSID 反而会触发认证失败
+        // (AUTH_FAIL reason=4 / AUTH_EXPIRE reason=2)。
         // 最多重试 3 次，第一次给 30s 容忍弱信号慢握手，后续 15s
         for (int retry = 0; retry < WIFI_MAX_RETRIES && !anySuccess; retry++) {
             uint32_t tmo = (retry == 0) ? 30000 : 15000;
@@ -344,6 +360,19 @@ void WifiManager::reconnectBackground() {
         connectMulti();
         return;
     }
+    // 确保驱动已启动：休眠时 powerOff() 会 esp_wifi_stop()，
+    // 唤醒后若不先 start 就 connect 会报 ESP_ERR_WIFI_NOT_STARTED。
+    // esp_wifi_start() 在已启动时返回 ESP_ERR_INVALID_STATE，属正常，忽略。
+    esp_err_t startErr = esp_wifi_start();
+    if (startErr != ESP_OK && startErr != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "reconnect: esp_wifi_start failed: %s", esp_err_to_name(startErr));
+        setState(WifiState::Disconnected);
+        return;
+    }
+    // esp_wifi_start() 会把省电模式重置为默认的 WIFI_PS_MIN_MODEM，
+    // 需重新强制 WIFI_PS_NONE，否则弱信号下 beacon 监听间隔拉长导致连接超时
+    // （日志中表现为 wifipm 进入 modem sleep）。
+    esp_wifi_set_ps(WIFI_PS_NONE);
     // 后台重连：不阻塞，不设 connecting_（事件走掉线分支更新状态）
     if (eventGroup_) {
         xEventGroupClearBits(eventGroup_, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);

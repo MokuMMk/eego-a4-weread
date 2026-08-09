@@ -24,6 +24,8 @@ struct AppConfig {
     int firstLineIndent;       // 首行缩进档位 (0=无 1=1字符 2=2字符)
     bool showImages;           // 插图开关（全局；按书开关在 imgoff.json）
     int fontSize;              // 正文字号
+    int brightness;            // 前光亮度（0..100）
+    int warmth;                // 前光色温（0..100）
 };
 
 class Config {

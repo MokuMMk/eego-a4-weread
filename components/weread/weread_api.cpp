@@ -640,18 +640,33 @@ bool getChapterInfos(const std::string& bookId, std::vector<ChapterEntry>& out,
 }
 
 // ---- psvts 提取 ----
+// 不依赖 \0 结尾，兼容 "psvts" / 'psvts' / psvts 三种写法
 std::string extractPsvts(const char* html, size_t len) {
     if (!html || !len) return "";
-    // 要求 html 有 \0 结尾（PSRAM 缓冲已补 \0）
-    const char* idx = strstr(html, "\"psvts\"");
+    auto find_in = [&](const char* needle, size_t nlen) -> const char* {
+        if (len < nlen) return nullptr;
+        for (size_t i = 0; i + nlen <= len; i++) {
+            if (memcmp(html + i, needle, nlen) == 0) return html + i;
+        }
+        return nullptr;
+    };
+    const char* end = html + len;
+    const char* idx = find_in("\"psvts\"", 7);
+    if (!idx) idx = find_in("'psvts'", 7);
+    if (!idx) idx = find_in("psvts", 5);
     if (!idx) return "";
-    const char* colon = strchr(idx, ':');
+    const char* colon = (const char*)memchr(idx, ':', end - idx);
     if (!colon) return "";
-    const char* q1 = strchr(colon, '"');
-    if (!q1) return "";
-    const char* q2 = strchr(q1 + 1, '"');
+    // 跳过冒号与空白
+    const char* p = colon + 1;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+    if (p >= end) return "";
+    char quote = 0;
+    if (*p == '"' || *p == '\'') { quote = *p; p++; }
+    if (!quote) return "";  // psvts 必须是字符串字面量
+    const char* q2 = (const char*)memchr(p, quote, end - p);
     if (!q2) return "";
-    return std::string(q1 + 1, (size_t)(q2 - q1 - 1));
+    return std::string(p, (size_t)(q2 - p));
 }
 
 std::string extractPsvts(const std::string& html) {
@@ -970,8 +985,13 @@ static bool fetch_chapter_raw(const std::string& bookId, const ChapterEntry& ch,
         if (psvts.empty()) {
             ESP_LOGE(TAG, "reader psvts 提取失败 hlen=%u path=%s head=%.100s",
                      (unsigned)hlen, rpath.c_str(), hlen ? html : "(空)");
+            // 把 hlen + head 前 80 字符放进 err，便于从屏幕直接诊断根因
+            // （会员书未解锁/cookie 失效/被反爬时 reader HTML 不含 psvts）
+            char diag[200];
+            snprintf(diag, sizeof(diag), "psvts失败 hlen=%u head:%.80s",
+                     (unsigned)hlen, hlen ? html : "(空)");
             heap_caps_free(html);
-            err = "未提取到 psvts";
+            err = diag;
             return false;
         }
         heap_caps_free(html);
@@ -1013,7 +1033,12 @@ static bool fetch_chapter_raw(const std::string& bookId, const ChapterEntry& ch,
         }
         psvts = extractPsvts(html, hlen);
         heap_caps_free(html);
-        if (psvts.empty()) { err = "重取 psvts 失败"; return false; }
+        if (psvts.empty()) {
+            char diag[200];
+            snprintf(diag, sizeof(diag), "重取psvts失败 hlen=%u", (unsigned)hlen);
+            err = diag;
+            return false;
+        }
         g_psvts_book = bookId;
         g_psvts = psvts;
         e0_body = shard_body();

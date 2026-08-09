@@ -1,32 +1,17 @@
 // EEGO A4 电源管理实现 — GPIO4 锁存 + 电池 ADC + 充电状态
 // 纯 ESP-IDF v5.x，使用 adc_oneshot + adc_cali_scheme (curve_fitting)
 #include "power_manager.h"
+#include "frontlight.h"
 
 #include <esp_log.h>
 #include <esp_sleep.h>
 #include <driver/i2c.h>
 #include <esp_adc/adc_cali_scheme.h>
 #include <cstring>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char* PM_TAG = "eego_pm";
-
-// 确保共享 I2C 总线已安装（与 GSLX680 / PCF8563 共用 I2C_NUM_0）
-static esp_err_t pmEnsureI2cBus() {
-    i2c_config_t conf;
-    memset(&conf, 0, sizeof(conf));
-    conf.mode = I2C_MODE_MASTER;
-    conf.sda_io_num = static_cast<gpio_num_t>(eego::I2C_SDA);
-    conf.scl_io_num = static_cast<gpio_num_t>(eego::I2C_SCL);
-    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;
-    conf.master.clk_speed = eego::I2C_HZ;
-    esp_err_t err = i2c_param_config(I2C_NUM_0, &conf);
-    if (err != ESP_OK) return err;
-    err = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
-    // ESP_ERR_INVALID_STATE = 驱动已安装，可忽略
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
-    return ESP_OK;
-}
 
 namespace eego {
 
@@ -94,18 +79,9 @@ void PowerManager::initAdc() {
 }
 
 void PowerManager::detectLm3630a() {
-    if (pmEnsureI2cBus() != ESP_OK) {
-        lm3630aPresent_ = false;
-        chargeActiveHigh_ = false;
-        return;
-    }
-
-    // 探测 LM3630A @ I2C 0x36：读寄存器 0x00，ACK 则在位
-    uint8_t reg = 0x00;
-    uint8_t val = 0;
-    esp_err_t err = i2c_master_write_read_device(
-        I2C_NUM_0, eego::LM3630A_ADDRESS, &reg, 1, &val, 1, pdMS_TO_TICKS(100));
-    lm3630aPresent_ = (err == ESP_OK);
+    // 读取 FrontlightManager 缓存的前光存在性（首次探测由 FrontlightManager
+    // 完成并缓存，此处非破坏性读取，不再 toggle GPIO12，避免关闭前光）
+    lm3630aPresent_ = FrontlightManager::instance().present();
 
     // LM3630A 在位 → 充电状态 active-high（INPUT_PULLDOWN）
     // LM3630A 不在位 → 充电状态 active-low（INPUT_PULLUP）

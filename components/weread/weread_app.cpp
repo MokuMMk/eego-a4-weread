@@ -9,15 +9,13 @@
 #include "sd_card.h"
 #include "sleep_manager.h"
 #include "serial_debug.h"
+#include "frontlight.h"
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
-#include "esp_ota_ops.h"
-#include "esp_crt_bundle.h"
-#include "esp_http_client.h"
 #include "mbedtls/platform.h"
 
 #include <algorithm>
@@ -32,11 +30,6 @@
 
 static const char* TAG = "weread_app";
 
-// ---- OTA 升级常量 ----
-#define OTA_FIRMWARE_URL "https://flash.kever.ink/firmware/papers3-weread-eegoa4.bin"
-#define OTA_NVS_NAMESPACE "ota_info"
-#define OTA_NVS_KEY "fw_time"
-
 // ---- 屏幕几何常量 ----
 static constexpr int16_t SCR_W = 552;   // PortraitCanvas::WIDTH
 static constexpr int16_t SCR_H = 768;   // PortraitCanvas::HEIGHT
@@ -49,9 +42,17 @@ static constexpr int FULL_REFRESH_EVERY = 8;
 static constexpr int SHELF_PER_PAGE = 6;   // 3列×2行网格
 static constexpr int LAYOUT_ROW_H = 44;
 static constexpr int FONT_ROW_H = 48;
-static constexpr int FONT_LIST_Y0 = 96 + 3 * LAYOUT_ROW_H + 16;
+static constexpr int FONT_LIST_Y0 = 96;
 static constexpr int TOC_LIST_Y0 = 80;
 static constexpr int AUTO_SLEEP_MS = 5 * 60 * 1000;
+
+// 阅读浮动菜单几何
+static constexpr int MENU_X = (SCR_W - 400) / 2;   // 76
+static constexpr int MENU_W = 400;
+static constexpr int MENU_Y = 120;
+static constexpr int MENU_HEADER_H = 44;
+static constexpr int MENU_ROW_H = 64;
+static constexpr int MENU_RADIUS = 20;
 
 // 灰底区域（#D9D9D9 用 Bayer 抖动 gray=11 实现）
 static void fillGray(eego::PortraitCanvas* cv, int16_t x, int16_t y, int16_t w, int16_t h) {
@@ -150,23 +151,6 @@ void WereadApp::run() {
     // 2. mbedTLS 内存分配走 PSRAM（DRAM 不足时 TLS 握手会失败）
     // 延迟到 WiFi 初始化之后设置（避免影响 WiFi/NVS 内部分配）
     // 将在 initWifi() 完成后设置
-
-    // 2.5 OTA 分区诊断（验证 esp_ota_get_running_partition 是否正常）
-    {
-        const esp_partition_t *p = esp_ota_get_running_partition();
-        ESP_LOGI(TAG, "=== OTA 诊断 ===");
-        ESP_LOGI(TAG, "running_partition ptr = %p", p);
-        if (p) {
-            ESP_LOGI(TAG, "  label=%s type=%d subtype=%d address=0x%x size=0x%x",
-                     p->label, p->type, p->subtype, p->address, p->size);
-        } else {
-            ESP_LOGE(TAG, "  esp_ota_get_running_partition 返回 NULL!");
-        }
-    }
-
-    // 2.6 OTA: 确认当前固件有效（取消回滚）
-    esp_ota_mark_app_valid_cancel_rollback();
-    ESP_LOGI(TAG, "OTA: 当前固件已标记为有效");
 
     // 3. 初始化硬件
     initHardware();
@@ -284,11 +268,21 @@ void WereadApp::initStorage() {
     // 配置
     Config::instance().load();
 
-    // 版式参数
+    // 版式参数（档位 0/1/2；配置旧值/默认值可能为百分比 100，越界时回退到标准档）
     const AppConfig& cfg = Config::instance().get();
-    if (cfg.lineHeight > 0) lineSpacing_ = cfg.lineHeight;
-    if (cfg.paragraphSpacing >= 0) paraGapMode_ = cfg.paragraphSpacing;
-    if (cfg.firstLineIndent >= 0) paraIndent_ = cfg.firstLineIndent;
+    lineSpacing_    = (cfg.lineHeight >= 0 && cfg.lineHeight <= 2) ? cfg.lineHeight : 1;
+    paraGapMode_    = (cfg.paragraphSpacing >= 0 && cfg.paragraphSpacing <= 2) ? cfg.paragraphSpacing : 1;
+    paraIndent_     = (cfg.firstLineIndent >= 0 && cfg.firstLineIndent <= 2) ? cfg.firstLineIndent : 2;
+
+    // 前光：读取配置并应用（有前光才启用）
+    brightness_ = cfg.brightness;
+    warmth_ = cfg.warmth;
+    frontlightPresent_ = FrontlightManager::instance().present();
+    ESP_LOGI(TAG, "前光检测: %s", frontlightPresent_ ? "识别到前光 (LM3630A)" : "未识别到前光 (LM3630A)");
+    if (frontlightPresent_) {
+        FrontlightManager::instance().setWarm((uint8_t)warmth_);
+        FrontlightManager::instance().setBrightness((uint8_t)brightness_);
+    }
 }
 
 void WereadApp::initFonts() {
@@ -515,12 +509,17 @@ void WereadApp::renderBootScreen(const char* subtitle) {
         }
     }
 
+    // 版本号（与设置页一致，置于状态区(底部100px)上方避免被覆盖）
+    if (FontManager::instance().uiLoaded()) {
+        canvas_->drawTextCentered(126, SCR_H - 168, 300, "版本: " FW_VERSION, 1, false);
+    }
+
     // 技术信息（串口）
     ESP_LOGI(TAG, "Free heap: %lu, Free PSRAM: %lu",
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
     currentScreen_ = ScreenId::Boot;
 }
 
@@ -545,7 +544,7 @@ void WereadApp::screenMsg(const char* l1, const char* l2, const char* l3) {
         if (l2 && l2[0]) FontManager::instance().drawText(*canvas_, PAD, 150, l2, 1, false);
         if (l3 && l3[0]) FontManager::instance().drawText(*canvas_, PAD, 240, l3, 1, false);
     }
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
 }
 
 // 可取消加载页：显示提示 + 底部"点按退出"小字，轮询触控/按键
@@ -560,7 +559,7 @@ bool WereadApp::screenMsgCancelable(const char* l1, const char* l2, const char* 
         // 底部小字提示
         FontManager::instance().drawText(*canvas_, PAD, SCR_H - 40, "点按退出", 0, false);
     }
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
 
     // 轮询触控/按键，超时返回 false
     uint32_t elapsed = 0;
@@ -958,7 +957,7 @@ void WereadApp::renderHome() {
         }
     }
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
 }
 
 // ================================================================
@@ -1074,7 +1073,7 @@ void WereadApp::renderBookshelf(bool fast) {
             canvas_->display(RefreshMode::Fast);
         }
     } else {
-        canvas_->display(RefreshMode::Full);
+        canvas_->display(RefreshMode::Fast);
         fastCount_ = 0;
     }
 }
@@ -1190,7 +1189,7 @@ void WereadApp::renderBookDetail() {
     int bw = fm.uiTextWidth(backLabel);
     fm.drawText(*canvas_, SCR_W - PAD - bw, SCR_H - 46, backLabel, 1, false);
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
 }
 
 void WereadApp::openBookDetail(int shelfIdx) {
@@ -1199,6 +1198,8 @@ void WereadApp::openBookDetail(int shelfIdx) {
     detail_ = weread_api::BookDetail{};
     reviews_.clear();
     prefetch_.clear();  // 切换书时清理预取缓存
+    lastPushPercent_ = -1;  // 切换书时重置进度上报节流
+    lastPushMs_ = 0;
     detailDeletePending_ = false;  // 切换书时清除删除确认
 
     std::string err;
@@ -1236,14 +1237,15 @@ bool WereadApp::fetchToc(const std::string& bookId) {
     bookFormat_.clear();
     std::string err;
 
-    // 0. 离线模式：直接读本地目录缓存，跳过在线请求（网络必然失败，避免长时间卡"获取目录"）
-    if (offlineMode_ && SdCard::instance().ready() &&
-        Storage::instance().loadTocCache(bookId.c_str(), chapters_, bookFormat_)) {
-        ESP_LOGI(TAG, "离线目录来自本地缓存: %d 章", (int)chapters_.size());
+    // 0. 本地目录缓存无条件优先（已下载过的书直接用本地目录，不走网络）
+    if (SdCard::instance().ready() &&
+        Storage::instance().loadTocCache(bookId.c_str(), chapters_, bookFormat_) &&
+        !chapters_.empty()) {
+        ESP_LOGI(TAG, "目录来自本地缓存: %d 章", (int)chapters_.size());
         return true;
     }
 
-    // 1. 在线获取目录（3 次尝试）
+    // 1. 本地未命中 → 在线获取目录（3 次尝试）
     for (int attempt = 0; attempt < 3 && chapters_.empty(); attempt++) {
         if (attempt && pollTouchDuringDelay(1500 * attempt)) return false;
         weread_api::getChapterInfos(bookId, chapters_, bookFormat_, err);
@@ -1254,13 +1256,6 @@ bool WereadApp::fetchToc(const std::string& bookId) {
         if (SdCard::instance().ready()) {
             Storage::instance().saveTocCache(bookId.c_str(), chapters_, bookFormat_.c_str());
         }
-        return true;
-    }
-
-    // 2. 在线失败 → 回退本地目录缓存（离线阅读已下载的书，无需网络）
-    if (SdCard::instance().ready() &&
-        Storage::instance().loadTocCache(bookId.c_str(), chapters_, bookFormat_)) {
-        ESP_LOGI(TAG, "目录来自本地缓存: %d 章", (int)chapters_.size());
         return true;
     }
 
@@ -1375,17 +1370,29 @@ void WereadApp::paginateCurrent() {
 }
 
 void WereadApp::renderReadingPage(RefreshMode mode, bool wait) {
-    previousScreen_ = currentScreen_;
+    // 仅在"刚进入阅读"时记录上一屏；翻页/刷新重绘时 currentScreen_ 已是 Reading，
+    // 不再覆盖 previousScreen_（否则返回键会丢失来源屏幕）
+    if (currentScreen_ != ScreenId::Reading) {
+        previousScreen_ = currentScreen_;
+    }
     currentScreen_ = ScreenId::Reading;
     canvas_->clear();
 
     auto& fm = FontManager::instance();
 
-    // 标题
-    std::string title = chapterTitle_;
-    truncatePx(title, 240);
-    fm.drawText(*canvas_, PAD, 14, title.c_str(), 1, true);
-    drawStatusBar(12);
+    // 左上角：章节号 & 章节名；右上角：电量 + WiFi
+    std::string chapLabel;
+    if (chapterIdx_ >= 0 && chapterIdx_ < (int)chapters_.size()) {
+        chapLabel = "第" + std::to_string(chapterIdx_ + 1) + "章 ";
+        chapLabel += chapters_[chapterIdx_].title;
+    } else {
+        chapLabel = chapterTitle_;
+        if (chapLabel.empty()) chapLabel = "阅读";
+    }
+    int statusLeft = drawStatusBar(12);   // 右上角电量+WiFi，返回状态区左边缘
+    int maxChapW = statusLeft - PAD - 16; // 避免与状态栏重叠
+    truncatePx(chapLabel, maxChapW);
+    fm.drawText(*canvas_, PAD, 14, chapLabel.c_str(), 1, true);
     canvas_->drawLine(PAD - 12, 56, SCR_W - PAD, 56, BLACK);
 
     int lh = readLineHeight(), pgGap = paraGap();
@@ -1452,15 +1459,14 @@ void WereadApp::renderReadingPage(RefreshMode mode, bool wait) {
         }
     }
 
-    // 页脚
-    fm.drawText(*canvas_, PAD, SCR_H - 40, "版式", 1, false);
+    // 页脚：仅页码
     char pg[32];
     snprintf(pg, sizeof(pg), "%d/%d", page_ + 1, (int)pages_.size());
     int pgw = fm.uiTextWidth(pg);
     fm.drawText(*canvas_, (SCR_W - pgw) / 2, SCR_H - 40, pg, 1, false);
-    const char* shelfLabel = "书架";
-    int sw = fm.uiTextWidth(shelfLabel);
-    fm.drawText(*canvas_, SCR_W - PAD - sw, SCR_H - 40, shelfLabel, 1, false);
+
+    if (readingMenu_) renderReadingMenu();
+    if (layoutSel_ >= 0) renderLayoutSelect();
 
     if (wait) {
         canvas_->display(mode);
@@ -1600,7 +1606,24 @@ void WereadApp::openChapter(int chIdx, int page) {
     chapterIdx_ = chIdx;
     blocks_.clear();
 
-    // 1. 先尝试预取缓存命中（命中则跳过在线请求，实现秒开）
+    // 1. 本地章节缓存无条件优先（已下载过的章节直接用，不走网络，避免 psvts/会员书在线失败）
+    std::vector<weread_api::ContentBlock> cached;
+    if (SdCard::instance().ready() &&
+        Storage::instance().chapterCacheLoad(curBook_.bookId.c_str(),
+                                             chapters_[chIdx].chapterUid.c_str(), cached) &&
+        !cached.empty()) {
+        blocks_ = std::move(cached);
+        chapterTitle_ = chapters_[chIdx].title;
+        page_ = 0;
+        paginateCurrent();
+        if (page > 0 && page < (int)pages_.size()) page_ = page;
+        renderReadingPage(RefreshMode::Full, true);
+        saveProgress();
+        triggerPrefetch();  // 下一章仍后台预取（若已缓存则预取任务内部跳过）
+        return;
+    }
+
+    // 2. 本地未命中 → 尝试预取缓存命中（预取是后台在线拉取的结果）
     if (tryConsumePrefetch(chIdx)) {
         page_ = 0;
         paginateCurrent();
@@ -1611,23 +1634,7 @@ void WereadApp::openChapter(int chIdx, int page) {
         return;
     }
 
-    // 1.2 预取未命中时，尝试 SD 章节缓存（离线阅读）
-    std::vector<weread_api::ContentBlock> cached;
-    if (SdCard::instance().ready() &&
-        Storage::instance().chapterCacheLoad(curBook_.bookId.c_str(),
-                                             chapters_[chIdx].chapterUid.c_str(), cached)) {
-        blocks_ = std::move(cached);
-        chapterTitle_ = chapters_[chIdx].title;
-        page_ = 0;
-        paginateCurrent();
-        if (page > 0 && page < (int)pages_.size()) page_ = page;
-        renderReadingPage(RefreshMode::Full, true);
-        saveProgress();
-        triggerPrefetch();  // 下一章仍尝试后台预取（若已缓存则不需要网络）
-        return;
-    }
-
-    // 1.5 预取已失败（如会员章节 e_0），直接显示错误，点击返回主页
+    // 2.5 预取已失败（如会员章节 e_0），直接显示错误，点击返回主页
     if (!prefetch_.loading && prefetch_.chapterIdx == chIdx && !prefetch_.failedErr.empty()) {
         const std::string& ferr = prefetch_.failedErr;
         bool isMember = (ferr.find("e_0") != std::string::npos);
@@ -1678,8 +1685,56 @@ void WereadApp::openChapter(int chIdx, int page) {
     triggerPrefetch();
 }
 
+// 按 chapterUid 定位章节下标：当前已加载目录优先，其次本地目录缓存
+int WereadApp::chapterUidToIndex(const std::string& uid) {
+    if (uid.empty()) return -1;
+    if (!chapters_.empty()) {
+        for (int i = 0; i < (int)chapters_.size(); i++)
+            if (chapters_[i].chapterUid == uid) return i;
+    }
+    std::vector<weread_api::ChapterEntry> toc;
+    std::string fmt;
+    if (SdCard::instance().ready() &&
+        Storage::instance().loadTocCache(curBook_.bookId.c_str(), toc, fmt)) {
+        for (int i = 0; i < (int)toc.size(); i++)
+            if (toc[i].chapterUid == uid) return i;
+    }
+    return -1;
+}
+
+// 在线进度同步（拉取方向）：服务器进度 > 本地 → 用服务器位置覆盖本地。
+// 仅在能定位到章节（已下载/有目录缓存）时写回，否则留待 continueReading 用服务器兜底。
+void WereadApp::syncReadingProgress() {
+    if (!wifiConnected_ || !isLoggedIn_) return;
+    if (curBook_.bookId.empty() || !SdCard::instance().ready()) return;
+
+    int serverPct = curBook_.progress;
+    if (serverPct <= 0) return;  // 无服务器进度，无需同步
+
+    BookProgress bp;
+    bool hasLoc = Storage::instance().loadProgress(curBook_.bookId.c_str(), bp);
+    int localPct = (hasLoc && bp.percent >= 0) ? bp.percent : 0;
+
+    if (serverPct <= localPct) return;  // 本地未落后，无需拉取
+
+    int chIdx = chapterUidToIndex(curBook_.progressChapterUid);
+    if (chIdx < 0) return;  // 无法定位章节（未下载且无目录缓存），跳过
+
+    BookProgress nb = {};
+    nb.chapterIdx = chIdx;
+    nb.page = 0;
+    nb.percent = serverPct;
+    strncpy(nb.title, curBook_.title.c_str(), sizeof(nb.title) - 1);
+    Storage::instance().saveProgress(curBook_.bookId.c_str(), nb);
+    lastPushPercent_ = -1;  // 进度被拉取改写，重置上报节流
+    ESP_LOGI(TAG, "进度同步: 服务器 %d%% > 本地 %d%%, 拉取到 ch%d", serverPct, localPct, chIdx);
+}
+
 void WereadApp::continueReading() {
     if (curBook_.bookId.empty() || chapters_.empty()) return;
+
+    // 在线时先尝试拉取服务器进度（若服务器领先）
+    syncReadingProgress();
 
     int chIdx = 0, page = 0;
     // 本地进度优先：在本设备读过则直接用本地章节/页码
@@ -1737,6 +1792,25 @@ void WereadApp::saveProgress() {
     strncpy(st.cover, curBook_.cover.c_str(), sizeof(st.cover) - 1);
     strncpy(st.format, bookFormat_.c_str(), sizeof(st.format) - 1);
     Storage::instance().saveState(st);
+
+    // 在线自动上报：本地进度 > 服务器进度 → 上传到云端（节流，避免每翻一页都发）
+    if (wifiConnected_ && isLoggedIn_ && bp.percent >= 0) {
+        int serverPct = curBook_.progress;
+        int64_t now = esp_timer_get_time() / 1000;
+        int diff = bp.percent - lastPushPercent_;
+        // 进度前进 ≥3% 或距上次上报已超 60s 才上报
+        if (bp.percent > serverPct && (diff >= 3 || now - lastPushMs_ > 60000)) {
+            if (chapterIdx_ >= 0 && chapterIdx_ < (int)chapters_.size()) {
+                std::string err;
+                bool ok = weread_api::uploadProgress(
+                    curBook_.bookId, chapters_[chapterIdx_].chapterUid.c_str(),
+                    chapterIdx_, bp.percent, err);
+                if (ok) { lastPushPercent_ = bp.percent; lastPushMs_ = now; }
+                ESP_LOGI(TAG, "进度上报: 本地 %d%% > 服务器 %d%% → %s",
+                         bp.percent, serverPct, ok ? "OK" : err.c_str());
+            }
+        }
+    }
 }
 
 bool WereadApp::tryRestoreReading() {
@@ -1810,38 +1884,15 @@ void WereadApp::renderFontSelect() {
     canvas_->clear();
 
     auto& fm = FontManager::instance();
-    fm.drawText(*canvas_, PAD, 16, "版式", 1, false);
+    // 左上角返回箭头（与设置页一致）
+    canvas_->drawIcon(36, 32, ICON_CHEVRON_LEFT_32, 32, 32, BLACK);
+    fm.drawText(*canvas_, 88, 36, "版式", 1, true);
     // 右上角 × 关闭
     fm.drawText(*canvas_, SCR_W - PAD - 20, 12, "x", 1, false);
     drawStatusBar(14);
 
-    // 版式三行
-    static const char* LINE_NAMES[] = {"紧凑", "标准", "宽松"};
-    static const char* GAP_NAMES[] = {"无", "四分之一", "半行"};
-    static const char* INDENT_NAMES[] = {"无", "1 字符", "2 字符"};
-
-    int y = 96;
-    auto layoutRow = [&](const char* label, int val, const char* names[3]) {
-        fm.drawText(*canvas_, PAD, y + 4, label, 1, false);
-        int cx = SCR_W - PAD - 3 * 100 - 2 * 8;
-        for (int i = 0; i < 3; i++) {
-            drawCapsule(cx, y, 100, i == val);
-            // 胶囊内文字
-            int tw = fm.uiTextWidth(names[i]);
-            uint8_t color = (i == val) ? WHITE : BLACK;
-            fm.drawText(*canvas_, cx + (100 - tw) / 2, y + 6, names[i], 1, i == val);
-            cx += 100 + 8;
-        }
-        y += LAYOUT_ROW_H;
-    };
-    layoutRow("行间距", lineSpacing_, LINE_NAMES);
-    layoutRow("段间距", paraGapMode_, GAP_NAMES);
-    layoutRow("首行缩进", paraIndent_, INDENT_NAMES);
-
-    canvas_->drawLine(PAD, y + 4, SCR_W - PAD, y + 4, BLACK);
-    y += 16;
-
     // 字体列表
+    int y = FONT_LIST_Y0;
     for (size_t i = 0; i < fontList_.size() && y < SCR_H - 60; i++) {
         std::string name = fontList_[i];
         size_t slash = name.find_last_of('/');
@@ -1859,7 +1910,7 @@ void WereadApp::renderFontSelect() {
         y += FONT_ROW_H;
     }
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
 }
 
 void WereadApp::applyFont(int idx) {
@@ -1901,6 +1952,213 @@ void WereadApp::backToReading() {
     renderReadingPage(RefreshMode::Full, true);
 }
 
+void WereadApp::applyFrontlight() {
+    auto& fl = FrontlightManager::instance();
+    if (brightness_ <= 0) {
+        fl.off();
+    } else {
+        fl.setWarm((uint8_t)warmth_);
+        fl.setBrightness((uint8_t)brightness_);
+    }
+    AppConfig& cfg = Config::instance().mutableGet();
+    if (cfg.brightness != brightness_ || cfg.warmth != warmth_) {
+        cfg.brightness = brightness_;
+        cfg.warmth = warmth_;
+        Config::instance().save();
+    }
+}
+
+void WereadApp::openReadingMenu() {
+    readingMenu_ = true;
+    renderReadingPage(RefreshMode::Fast, true);
+}
+
+void WereadApp::closeReadingMenu() {
+    readingMenu_ = false;
+    renderReadingPage(RefreshMode::Fast, true);
+}
+
+void WereadApp::renderReadingMenu() {
+    auto& fm = FontManager::instance();
+    int nRows = frontlightPresent_ ? 6 : 4;
+    int panelH = MENU_HEADER_H + nRows * MENU_ROW_H;
+    fillGrayRound(canvas_, MENU_X, MENU_Y, MENU_W, panelH, MENU_RADIUS);
+
+    const char* header = "阅读设置";
+    int hw = fm.uiTextWidth(header);
+    fm.drawText(*canvas_, MENU_X + (MENU_W - hw) / 2, MENU_Y + 11, header, 1, true);
+    canvas_->drawLine(MENU_X + 16, MENU_Y + MENU_HEADER_H,
+                      MENU_X + MENU_W - 16, MENU_Y + MENU_HEADER_H, BLACK);
+
+    static const char* LINE_NAMES[] = {"紧凑", "标准", "宽松"};
+    static const char* GAP_NAMES[] = {"无", "1/4", "半行"};
+    static const char* INDENT_NAMES[] = {"无", "1字符", "2字符"};
+
+    int rowY = MENU_Y + MENU_HEADER_H;
+    auto drawLabel = [&](const char* s) {
+        int fh = fm.uiFontHeight();
+        fm.drawText(*canvas_, MENU_X + 24, rowY + (MENU_ROW_H - fh) / 2, s, 1, false);
+    };
+    auto drawSlider = [&](int value) {
+        // 30 级点击式滑动条：轨道外框 + 已选填充 + 指示点，等级 0~29 ↔ 值 0~100
+        const int trackW = 260, trackH = 10;
+        int sx = MENU_X + MENU_W - 24 - trackW;
+        int sy = rowY + (MENU_ROW_H - trackH) / 2;
+        // 轨道外框
+        canvas_->drawRect(sx, sy, trackW, trackH, BLACK);
+        // 已选填充比例
+        int fillW = (value * (trackW - 2)) / 100;
+        if (fillW > 0) canvas_->fillRect(sx + 1, sy + 1, fillW, trackH - 2, BLACK);
+        // 当前值指示点
+        int knobX = sx + 1 + fillW;
+        canvas_->fillRect(knobX - 2, sy - 3, 4, trackH + 6, BLACK);
+    };
+    auto drawValue = [&](const char* s) {
+        int tw = fm.uiTextWidth(s);
+        fm.drawText(*canvas_, MENU_X + MENU_W - 24 - tw, rowY + (MENU_ROW_H - fm.uiFontHeight()) / 2, s, 1, false);
+    };
+    auto nextRow = [&]() { rowY += MENU_ROW_H; };
+
+    if (frontlightPresent_) {
+        drawLabel("亮度"); drawSlider(brightness_); nextRow();
+        drawLabel("色温"); drawSlider(warmth_);     nextRow();
+    }
+    drawLabel("阅读字体"); drawValue("选择");   nextRow();
+    drawLabel("行间距");   drawValue(LINE_NAMES[lineSpacing_]);   nextRow();
+    drawLabel("段间距");   drawValue(GAP_NAMES[paraGapMode_]);    nextRow();
+    drawLabel("首行缩进"); drawValue(INDENT_NAMES[paraIndent_]);  nextRow();
+}
+
+void WereadApp::handleReadingMenuTouch(int16_t x, int16_t y) {
+    int nRows = frontlightPresent_ ? 6 : 4;
+    int panelH = MENU_HEADER_H + nRows * MENU_ROW_H;
+    int panelBot = MENU_Y + panelH;
+
+    // 点击面板外/标题栏 → 关闭菜单
+    if (x < MENU_X || x >= MENU_X + MENU_W || y < MENU_Y || y >= panelBot) {
+        closeReadingMenu();
+        return;
+    }
+
+    int row = (y - (MENU_Y + MENU_HEADER_H)) / MENU_ROW_H;
+    if (row < 0 || row >= nRows) { closeReadingMenu(); return; }
+
+    // 亮度/色温：30 级点击式滑动条
+    // 热区覆盖整行（上下=整行高，左右略超出面板），既保证能点到轨道两端（0/100），
+    // 又只在整行内响应，避免误触到下一行（阅读字体）打开字体页
+    if (frontlightPresent_ && row < 2) {
+        const int trackW = 260;
+        int sx = MENU_X + MENU_W - 24 - trackW;
+        int hax = MENU_X + 6;
+        int haw = MENU_W - 12;
+        int hay = MENU_Y + MENU_HEADER_H + row * MENU_ROW_H;
+        if (x >= hax && x < hax + haw && y >= hay && y < hay + MENU_ROW_H) {
+            // x 映射到轨道：轨道外钳制到 0/100
+            int px = x < sx ? sx : (x > sx + trackW ? sx + trackW : x);
+            int level = (px - sx) * 29 / trackW;
+            if (level < 0) level = 0;
+            if (level > 29) level = 29;
+            int val = level * 100 / 29;
+            if (row == 0) brightness_ = val; else warmth_ = val;
+            applyFrontlight();
+            // 仅重绘菜单面板并快刷，不重绘正文整页
+            renderReadingMenu();
+            canvas_->display(RefreshMode::Fast);
+        }
+        return;
+    }
+
+    // 其余行映射
+    int idx = frontlightPresent_ ? (row - 2) : row;
+    switch (idx) {
+        case 0:  // 阅读字体 → 字体选择页
+            loadFontList();
+            readingMenu_ = false;
+            renderFontSelect();
+            break;
+        case 1:  // 行间距 → 选择弹窗
+            layoutSel_ = 0;
+            renderReadingPage(RefreshMode::Fast, true);
+            break;
+        case 2:  // 段间距 → 选择弹窗
+            layoutSel_ = 1;
+            renderReadingPage(RefreshMode::Fast, true);
+            break;
+        case 3:  // 首行缩进 → 选择弹窗
+            layoutSel_ = 2;
+            renderReadingPage(RefreshMode::Fast, true);
+            break;
+        default:
+            closeReadingMenu();
+            break;
+    }
+}
+
+// 版式选择弹窗：绘制三个选项供选择，当前项以 "v" 选中标记
+void WereadApp::renderLayoutSelect() {
+    auto& fm = FontManager::instance();
+    static const char* TITLES[] = {"行间距", "段间距", "首行缩进"};
+    static const char* OPTS[3][3] = {
+        {"紧凑", "标准", "宽松"},
+        {"无", "1/4", "半行"},
+        {"无", "1字符", "2字符"}
+    };
+    int cur[] = {lineSpacing_, paraGapMode_, paraIndent_};
+    int idx = layoutSel_;
+
+    int panelW = 320, rowH = 64, headerH = 44;
+    int panelX = (SCR_W - panelW) / 2;
+    int panelY = (SCR_H - (headerH + 3 * rowH)) / 2;
+    fillGrayRound(canvas_, panelX, panelY, panelW, headerH + 3 * rowH, MENU_RADIUS);
+
+    // 标题
+    int hw = fm.uiTextWidth(TITLES[idx]);
+    fm.drawText(*canvas_, panelX + (panelW - hw) / 2, panelY + 11, TITLES[idx], 1, true);
+    canvas_->drawLine(panelX + 16, panelY + headerH, panelX + panelW - 16, panelY + headerH, BLACK);
+
+    // 三个选项
+    int rowY = panelY + headerH;
+    for (int i = 0; i < 3; i++) {
+        if (i == cur[idx]) {
+            fm.drawText(*canvas_, panelX + 24, rowY + (rowH - fm.uiFontHeight()) / 2, "v", 1, false);
+        }
+        fm.drawText(*canvas_, panelX + 52, rowY + (rowH - fm.uiFontHeight()) / 2, OPTS[idx][i], 1, false);
+        rowY += rowH;
+    }
+}
+
+// 版式选择弹窗触控
+void WereadApp::handleLayoutSelectTouch(int16_t x, int16_t y) {
+    int panelW = 320, rowH = 64, headerH = 44;
+    int panelX = (SCR_W - panelW) / 2;
+    int panelY = (SCR_H - (headerH + 3 * rowH)) / 2;
+
+    // 点击面板外 → 关闭弹窗
+    if (x < panelX || x >= panelX + panelW || y < panelY || y >= panelY + headerH + 3 * rowH) {
+        layoutSel_ = -1;
+        renderReadingPage(RefreshMode::Fast, true);
+        return;
+    }
+    // 标题栏 → 关闭弹窗
+    if (y < panelY + headerH) {
+        layoutSel_ = -1;
+        renderReadingPage(RefreshMode::Fast, true);
+        return;
+    }
+    // 选项
+    int o = (y - (panelY + headerH)) / rowH;
+    if (o < 0 || o >= 3) return;
+    switch (layoutSel_) {
+        case 0: lineSpacing_ = o; break;
+        case 1: paraGapMode_ = o; break;
+        case 2: paraIndent_  = o; break;
+        default: return;
+    }
+    applyLayout();
+    layoutSel_ = -1;
+    renderReadingPage(RefreshMode::Fast, true);
+}
+
 // ================================================================
 // 设置页 Settings
 // ================================================================
@@ -1918,23 +2176,28 @@ void WereadApp::renderSettings() {
     // 2. 标题 x=88 y=32 "设置" scale=1 加粗
     fm.drawText(*canvas_, 88, 36, "设置", 1, true);
 
-    // 3. 6个条目（每个 w=496 h=64 圆角16 灰底，无边框）
+    // 顶部前光控制（与阅读菜单一致）：检测到前光才显示亮度/色温两行滑动条
+    const int flOffset = frontlightPresent_ ? 144 : 0;  // 前光两行(64*2+间隙16)占用的高度
+    if (frontlightPresent_) {
+        renderFrontlightRows();
+    }
+
+    // 3. 5个条目（每个 w=496 h=64 圆角16 灰底，无边框）
     struct SettingItem {
-        int16_t y;
+        int32_t y;
         const char* mainText;
         const char* subText;
         bool bold;
     };
     SettingItem items[] = {
-        {100, "退出登录", nullptr,             false},
-        {180, "WiFi 重连", "用已保存配置重连",  false},
-        {260, "WiFi 重置", "清除配置重新配网",  false},
-        {340, "重置设备", "清空缓存与账号",     true},
-        {420, "检查更新", FW_VERSION,           false},
-        {500, "返回主页", nullptr,             false},
+        {100 + flOffset, "退出登录", nullptr,             false},
+        {180 + flOffset, "WiFi 重连", "用已保存配置重连",  false},
+        {260 + flOffset, "WiFi 重置", "清除配置重新配网",  false},
+        {340 + flOffset, "重置设备", "清空缓存与账号",     true},
+        {420 + flOffset, "返回主页", nullptr,             false},
     };
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 5; i++) {
         auto& item = items[i];
         // 灰底圆角16（无边框）
         fillGrayRound(canvas_, 28, item.y, 496, 64, 16);
@@ -1961,7 +2224,30 @@ void WereadApp::renderSettings() {
     // 5. 版本号 x=126 y=750 居中（底部提示下方）
     canvas_->drawTextCentered(126, 750, 300, "版本: " FW_VERSION, 1, false);
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
+}
+
+// 仅绘制设置页顶部前光两行（亮度/色温），用于滑动条交互时的局部快刷
+void WereadApp::renderFrontlightRows() {
+    if (!frontlightPresent_) return;
+    auto& fm = FontManager::instance();
+    auto drawFlRowContent = [&](const char* label, int value, int rowY) {
+        // 标签
+        fm.drawText(*canvas_, 52, rowY + 22, label, 1, false);
+        // 30级点击式滑动条：轨道外框 + 已选填充 + 指示点，等级 0~29 ↔ 值 0~100
+        const int trackW = 260, trackH = 10;
+        int sx = 524 - 24 - trackW;
+        int sy = rowY + (64 - trackH) / 2;
+        canvas_->drawRect(sx, sy, trackW, trackH, BLACK);
+        int fillW = (value * (trackW - 2)) / 100;
+        if (fillW > 0) canvas_->fillRect(sx + 1, sy + 1, fillW, trackH - 2, BLACK);
+        int knobX = sx + 1 + fillW;
+        canvas_->fillRect(knobX - 2, sy - 3, 4, trackH + 6, BLACK);
+    };
+    // 一整块圆角背景（y=100..228，含亮度+色温两行），避免两行各自圆角拼接处的缺口
+    fillGrayRound(canvas_, 28, 100, 496, 128, 16);
+    drawFlRowContent("亮度", brightness_, 100);
+    drawFlRowContent("色温", warmth_, 164);
 }
 
 // ================================================================
@@ -2004,7 +2290,7 @@ void WereadApp::showNoSdScreen() {
                       centered("PLEASE INSERT THE SD CARD", 2), 330, 2, false);
     drawAsciiFallback("TAP THE SCREEN TO RESTART",
                       centered("TAP THE SCREEN TO RESTART", 2), 366, 2, false);
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
     currentScreen_ = ScreenId::Provision;
 
     ESP_LOGI(TAG, "SD 卡未挂载，等待点按重启");
@@ -2066,7 +2352,7 @@ void WereadApp::renderProvisionGuide() {
     // 4. 欢迎语 x=196 y=700 w=160 scale=1 加粗 居中
     canvas_->drawTextCentered(196, 704, 160, "欢迎", 1, true);
 
-    canvas_->display(RefreshMode::Full);
+    canvas_->display(RefreshMode::Fast);
     currentScreen_ = ScreenId::Provision;
 }
 
@@ -2115,7 +2401,7 @@ bool WereadApp::doQrLogin() {
         // 5. 底部提示 x=76 y=708 w=400 居中
         canvas_->drawTextCentered(76, 708, 400, "登录后自动同步书架与阅读进度", 1, false);
 
-        canvas_->display(RefreshMode::Full);
+        canvas_->display(RefreshMode::Fast);
     };
 
     auto msg = [this](const std::string& l1, const std::string& l2, const std::string& l3) {
@@ -2141,6 +2427,8 @@ bool WereadApp::doQrLogin() {
 // ================================================================
 
 void WereadApp::enterSleep() {
+    // 睡眠前关闭前光（省电），唤醒时再恢复
+    if (frontlightPresent_) FrontlightManager::instance().off();
     // 保存当前阅读进度到 state.json
     saveProgress();
     // 调用 SleepManager 进入浅睡
@@ -2196,6 +2484,12 @@ void WereadApp::onWakeFromSleep() {
     display_->begin();
     canvas_->resetClip();
 
+    // 唤醒后恢复前光（睡眠时已关闭），按配置恢复亮度和色温
+    if (frontlightPresent_) {
+        FrontlightManager::instance().setWarm((uint8_t)warmth_);
+        FrontlightManager::instance().setBrightness((uint8_t)brightness_);
+    }
+
     // 先恢复 UI 显示（阅读页/主页/书架页），WiFi 重连挪到后台静默进行
     if (currentScreen_ == ScreenId::Reading && !pages_.empty()) {
         renderReadingPage(RefreshMode::Full, true);
@@ -2217,7 +2511,8 @@ void WereadApp::handleTouch(const TouchEvent& evt) {
         return;
     }
     if (evt.type == TouchEventType::FrontKeyShort) {
-        if (currentScreen_ == ScreenId::Reading) turnPage(1);
+        // 返回键：任何屏幕/状态下短按一律回到主页
+        renderHome();
         return;
     }
     if (evt.type != TouchEventType::Touch || !evt.pressed) return;
@@ -2240,13 +2535,7 @@ void WereadApp::handleButton(const ButtonEvent& evt) {
         enterSleep();
         return;
     }
-    if (currentScreen_ == ScreenId::Reading) {
-        if (evt.id == ButtonId::Up) {
-            if (evt.action == ButtonAction::ShortPress) turnPage(-1);
-        } else if (evt.id == ButtonId::Down) {
-            if (evt.action == ButtonAction::ShortPress) turnPage(1);
-        }
-    } else if (currentScreen_ == ScreenId::Bookshelf) {
+    if (currentScreen_ == ScreenId::Bookshelf) {
         if (evt.action == ButtonAction::ShortPress) {
             if (evt.id == ButtonId::Up) { shelfPage_--; renderBookshelf(true); }
             else if (evt.id == ButtonId::Down) { shelfPage_++; renderBookshelf(true); }
@@ -2353,35 +2642,32 @@ void WereadApp::handleDetailTouch(int16_t x, int16_t y) {
 }
 
 void WereadApp::handleReadingTouch(int16_t x, int16_t y) {
-    // 顶部：左=目录，右=下一页
+    if (layoutSel_ >= 0) {
+        handleLayoutSelectTouch(x, y);
+        return;
+    }
+    if (readingMenu_) {
+        handleReadingMenuTouch(x, y);
+        return;
+    }
+    // 顶部：左=目录
     if (y < 70) {
-        if (x < 180) {
-            ESP_LOGI(TAG, "目录");
+        if (x < 260) {
             if (!chapters_.empty()) {
                 tocPage_ = chapterIdx_ / std::max(1, (SCR_H - TOC_LIST_Y0 - 70) / (uiLineHeight() + 10));
                 renderToc();
             }
-        } else {
-            turnPage(1);
         }
         return;
     }
-    // 左下角版式
-    if (y > SCR_H - 60 && x < 120) {
-        ESP_LOGI(TAG, "版式设置");
-        loadFontList();
-        renderFontSelect();
-        return;
+    // 三分区：左半=上一页，右半=下一页，中=菜单
+    if (x < SCR_W / 3) {
+        turnPage(-1);
+    } else if (x >= 2 * SCR_W / 3) {
+        turnPage(1);
+    } else {
+        openReadingMenu();
     }
-    // 右下角书架
-    if (y > SCR_H - 60 && x > SCR_W - 120) {
-        ESP_LOGI(TAG, "返回书架");
-        if (SdCard::instance().ready()) Storage::instance().removeState();
-        renderBookshelf(false);
-        return;
-    }
-    // 左半=上页，右半=下页
-    turnPage(x >= SCR_W / 2 ? 1 : -1);
 }
 
 void WereadApp::handleTocTouch(int16_t x, int16_t y) {
@@ -2410,8 +2696,8 @@ void WereadApp::handleTocTouch(int16_t x, int16_t y) {
 }
 
 void WereadApp::handleFontTouch(int16_t x, int16_t y) {
-    // × 关闭
-    if (y < 60 && x > SCR_W - 60) {
+    // 左上角返回键 → 回到阅读（热区放大：覆盖顶部左半区）
+    if (y < 90 && x < 160) {
         if (layoutDirty_) {
             applyLayout();
             layoutDirty_ = false;
@@ -2419,26 +2705,16 @@ void WereadApp::handleFontTouch(int16_t x, int16_t y) {
         backToReading();
         return;
     }
-    if (y < 60) return;
-
-    // 版式三行
-    if (y >= 96 && y < 96 + 3 * LAYOUT_ROW_H) {
-        int row = (y - 96) / LAYOUT_ROW_H;
-        int* val = (row == 0) ? &lineSpacing_ : (row == 1) ? &paraGapMode_ : &paraIndent_;
-        int cx = SCR_W - PAD - 3 * 100 - 2 * 8;
-        for (int i = 0; i < 3; i++) {
-            if (x >= cx && x < cx + 100) {
-                if (*val != i) {
-                    *val = i;
-                    layoutDirty_ = true;
-                    renderFontSelect();
-                }
-                return;
-            }
-            cx += 100 + 8;
+    // × 关闭（右上角）
+    if (y < 90 && x > SCR_W - 160) {
+        if (layoutDirty_) {
+            applyLayout();
+            layoutDirty_ = false;
         }
+        backToReading();
         return;
     }
+    if (y < 90) return;
 
     // 字体列表
     if (y < FONT_LIST_Y0) return;
@@ -2520,8 +2796,35 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         return;
     }
 
-    // 条目1: 退出登录 (28, 100, 496, 64)
-    if (x >= 28 && x < 524 && y >= 100 && y < 164) {
+    // 顶部前光控制（与阅读菜单一致）：亮度/色温 30级点击式滑动条
+    const int flOffset = frontlightPresent_ ? 144 : 0;
+    if (frontlightPresent_ && y >= 100 && y < 164 + 64) {
+        int row = (y - 100) / 64;  // 0=亮度, 1=色温
+        if (row >= 0 && row < 2) {
+            const int trackW = 260;
+            int sx = 524 - 24 - trackW;
+            int hax = 28 + 6;
+            int haw = 496 - 12;
+            int hay = 100 + row * 64;
+            if (x >= hax && x < hax + haw && y >= hay && y < hay + 64) {
+                // x 映射到轨道：外钳制到 0/100
+                int px = x < sx ? sx : (x > sx + trackW ? sx + trackW : x);
+                int level = (px - sx) * 29 / trackW;
+                if (level < 0) level = 0;
+                if (level > 29) level = 29;
+                int val = level * 100 / 29;
+                if (row == 0) brightness_ = val; else warmth_ = val;
+                applyFrontlight();
+                // 仅重绘前光两行并快刷，避免整页重绘造成的慢刷新
+                renderFrontlightRows();
+                canvas_->display(RefreshMode::Fast);
+            }
+            return;
+        }
+    }
+
+    // 条目1: 退出登录 (28, 100+flOffset, 496, 64)
+    if (x >= 28 && x < 524 && y >= 100 + flOffset && y < 164 + flOffset) {
         ESP_LOGI(TAG, "设置 → 退出登录");
         screenMsg("退出登录中...", "清除账号信息");
         WR.setCookie("wr_vid", "");
@@ -2533,8 +2836,8 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         esp_restart();
         return;
     }
-    // 条目2: WiFi 重连 (28, 180, 496, 64) — 用已保存配置重连
-    if (x >= 28 && x < 524 && y >= 180 && y < 244) {
+    // 条目2: WiFi 重连 (28, 180+flOffset, 496, 64) — 用已保存配置重连
+    if (x >= 28 && x < 524 && y >= 180 + flOffset && y < 244 + flOffset) {
         ESP_LOGI(TAG, "设置 → WiFi 重连");
         settingsResetPending_ = false;
         screenMsg("正在重连 WiFi...", "扫描可见网络");
@@ -2551,8 +2854,8 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         }
         return;
     }
-    // 条目3: WiFi 重置 (28, 260, 496, 64) — 清除配置重新配网
-    if (x >= 28 && x < 524 && y >= 260 && y < 324) {
+    // 条目3: WiFi 重置 (28, 260+flOffset, 496, 64) — 清除配置重新配网
+    if (x >= 28 && x < 524 && y >= 260 + flOffset && y < 324 + flOffset) {
         ESP_LOGI(TAG, "设置 → WiFi 重置（清除配置重新配网）");
         settingsResetPending_ = false;
         // 清空 wifi_list 并保存
@@ -2563,8 +2866,8 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         startProvisioningAndWait();
         return;
     }
-    // 条目4: 重置设备 (28, 340, 496, 64) — 双击确认
-    if (x >= 28 && x < 524 && y >= 340 && y < 404) {
+    // 条目4: 重置设备 (28, 340+flOffset, 496, 64) — 双击确认
+    if (x >= 28 && x < 524 && y >= 340 + flOffset && y < 404 + flOffset) {
         if (!settingsResetPending_) {
             // 第一次点击：显示确认提示
             settingsResetPending_ = true;
@@ -2588,16 +2891,8 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
         }
         return;
     }
-    // 条目5: 检查更新 (28, 420, 496, 64)
-    if (x >= 28 && x < 524 && y >= 420 && y < 484) {
-        ESP_LOGI(TAG, "设置 → 检查更新");
-        settingsResetPending_ = false;
-        checkOtaUpdate();
-        renderSettings();
-        return;
-    }
-    // 条目6: 返回主页 (28, 500, 496, 64)
-    if (x >= 28 && x < 524 && y >= 500 && y < 564) {
+    // 条目5: 返回主页 (28, 420+flOffset, 496, 64)
+    if (x >= 28 && x < 524 && y >= 420 + flOffset && y < 484 + flOffset) {
         settingsResetPending_ = false;
         navigateTo(ScreenId::Home);
         return;
@@ -2609,286 +2904,6 @@ void WereadApp::handleSettingsTouch(int16_t x, int16_t y) {
     }
 }
 
-// ================================================================
-// OTA 升级
-// ================================================================
-
-// OTA 下载上下文（由 HTTP 事件回调写入到 OTA 分区）
-struct OtaDlCtx {
-    esp_ota_handle_t handle = 0;
-    int total_written = 0;
-    int content_length = 0;   // 来自 Content-Length 头；0=未知
-    int last_pct = -1;        // 上次显示的百分比
-    bool error = false;       // esp_ota_write 失败
-    bool cancel = false;      // 用户点击取消
-    Gslx680Touch* touch = nullptr;
-    PortraitCanvas* cv = nullptr;
-};
-
-// OTA 固件下载 HTTP 事件回调：把数据流式写入 OTA 分区，每 10% 刷新进度
-static esp_err_t otaHttpEventHandler_(esp_http_client_event_t* evt) {
-    OtaDlCtx* ctx = (OtaDlCtx*)evt->user_data;
-    if (!ctx) return ESP_OK;
-    switch (evt->event_id) {
-        case HTTP_EVENT_ON_DATA: {
-            if (ctx->error || ctx->cancel || evt->data_len <= 0) break;
-
-            // 检查用户是否点击取消
-            if (ctx->touch) {
-                TouchEvent tevt = ctx->touch->poll();
-                if (tevt.type == TouchEventType::Touch && tevt.pressed) {
-                    ctx->cancel = true;
-                    ESP_LOGI(TAG, "OTA: 用户取消下载");
-                    break;
-                }
-            }
-
-            esp_err_t w = esp_ota_write(ctx->handle, evt->data, evt->data_len);
-            if (w != ESP_OK) {
-                ESP_LOGE(TAG, "OTA: esp_ota_write 失败: %s", esp_err_to_name(w));
-                ctx->error = true;
-            } else {
-                ctx->total_written += evt->data_len;
-                // 首包拿到 Content-Length（chunked 传输返回 -1，跳过百分比）
-                if (ctx->content_length == 0) {
-                    int64_t cl = esp_http_client_get_content_length(evt->client);
-                    ctx->content_length = (cl > 0) ? (int)cl : 0;
-                }
-                if (ctx->content_length > 0 && ctx->cv &&
-                    FontManager::instance().uiLoaded()) {
-                    int pct = (ctx->total_written * 100) / ctx->content_length;
-                    if (pct >= ctx->last_pct + 10) {
-                        ctx->last_pct = pct;
-                        char buf[32];
-                        snprintf(buf, sizeof(buf), "下载中 %d%%", pct);
-                        ctx->cv->fillRect(0, SCR_H - 100, SCR_W, 100, WHITE);
-                        int tw = FontManager::instance().uiTextWidth(buf);
-                        FontManager::instance().drawText(*ctx->cv,
-                            (SCR_W - tw) / 2, SCR_H - 70, buf, 1, false);
-                        // 底部小字提示可取消
-                        const char* hint = "点按退出";
-                        int hw = FontManager::instance().uiTextWidth(hint);
-                        FontManager::instance().drawText(*ctx->cv,
-                            (SCR_W - hw) / 2, SCR_H - 40, hint, 0, false);
-                        ctx->cv->display(RefreshMode::Fast);
-                    }
-                }
-            }
-            break;
-        }
-        default:
-            break;
-    }
-    return ESP_OK;
-}
-
-// 设置页入口：HEAD 检查固件版本（Last-Modified），与 NVS 记录对比，提示确认后升级
-void WereadApp::checkOtaUpdate() {
-    ESP_LOGI(TAG, "OTA: 检查更新（当前版本 " FW_VERSION ")");
-
-    // 1. 离线模式无法检查
-    if (offlineMode_ || !wifiConnected_) {
-        screenMsg("需要联网检查更新", FW_VERSION, "请先连接 WiFi");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return;
-    }
-
-    // 2. 检查中
-    screenMsg("检查更新中...", FW_VERSION);
-
-    // 3. HEAD 请求拿 Last-Modified
-    HttpResponse resp = WR.head(OTA_FIRMWARE_URL);
-    if (!resp.ok()) {
-        ESP_LOGW(TAG, "OTA: HEAD 失败 status=%d err=%s", resp.status, resp.error.c_str());
-        char l1[64];
-        snprintf(l1, sizeof(l1), "检查失败: %d", resp.status);
-        screenMsg(l1, resp.error.c_str());
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return;
-    }
-
-    // 4. 解析 Last-Modified（headers map 为小写 key）
-    auto it = resp.headers.find("last-modified");
-    if (it == resp.headers.end() || it->second.empty()) {
-        ESP_LOGW(TAG, "OTA: 服务器未返回 Last-Modified");
-        screenMsg("已是最新版本", FW_VERSION);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return;
-    }
-    const std::string& lastModified = it->second;
-    ESP_LOGI(TAG, "OTA: 服务器固件时间: %s", lastModified.c_str());
-
-    // 5. 读取已存储的 last-modified（上次成功升级的固件时间）
-    std::string stored;
-    nvs_handle_t h;
-    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        char buf[128] = {0};
-        size_t len = sizeof(buf);
-        if (nvs_get_str(h, OTA_NVS_KEY, buf, &len) == ESP_OK) {
-            stored = buf;
-        }
-        nvs_close(h);
-    }
-
-    // 6. 相同 → 已是最新
-    if (!stored.empty() && stored == lastModified) {
-        ESP_LOGI(TAG, "OTA: 已是最新版本");
-        screenMsg("已是最新版本", FW_VERSION);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return;
-    }
-
-    // 7. 发现新版本，提示确认
-    screenMsg("发现新版本", lastModified.c_str(), "点按确认更新");
-
-    // 8. 等待触控确认（30s 超时即取消）
-    uint32_t elapsed = 0;
-    const uint32_t step = 50;
-    bool confirmed = false;
-    while (elapsed < 30000) {
-        TouchEvent evt = touch_->poll();
-        if (evt.type == TouchEventType::Touch && evt.pressed) {
-            confirmed = true;
-            break;
-        }
-        ButtonEvent bevt;
-        if (ButtonManager::instance().poll(&bevt, 0)) {
-            confirmed = true;
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(step));
-        elapsed += step;
-    }
-
-    if (!confirmed) {
-        ESP_LOGI(TAG, "OTA: 用户未确认（超时），取消更新");
-        return;
-    }
-
-    // 9. 执行升级（成功时内部重启，不会返回）
-    performOtaUpdate(OTA_FIRMWARE_URL, lastModified);
-}
-
-// 执行 OTA：下载固件 → 写入 OTA 分区 → 切换启动分区 → 重启
-bool WereadApp::performOtaUpdate(const std::string& firmwareUrl, const std::string& lastModified) {
-    ESP_LOGI(TAG, "OTA: 开始升级 %s", firmwareUrl.c_str());
-    screenMsg("准备升级...", "下载固件中");
-
-    // 1. 获取待写入分区
-    const esp_partition_t* update_part = esp_ota_get_next_update_partition(NULL);
-    if (!update_part) {
-        ESP_LOGE(TAG, "OTA: 无法获取更新分区");
-        screenMsg("升级失败", "无可用 OTA 分区");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-    ESP_LOGI(TAG, "OTA: 写入分区 %s (0x%x bytes)", update_part->label, update_part->size);
-
-    // 2. 开始 OTA 写入（顺序写）
-    esp_ota_handle_t update_handle = 0;
-    esp_err_t err = esp_ota_begin(update_part, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA: esp_ota_begin 失败: %s", esp_err_to_name(err));
-        screenMsg("升级失败", "ota_begin 错误");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-
-    // 3. 独立 HTTP client 下载固件（不走 WereadClient 会话，异 host）
-    OtaDlCtx ctx;
-    ctx.handle = update_handle;
-    ctx.cv = canvas_;
-    ctx.touch = touch_;
-
-    esp_http_client_config_t config = {};
-    config.url = firmwareUrl.c_str();
-    config.cert_pem = NULL;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = 60000;
-    config.buffer_size = 1024;
-    config.buffer_size_tx = 1024;
-    config.event_handler = otaHttpEventHandler_;
-    config.user_data = &ctx;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(TAG, "OTA: esp_http_client_init 失败");
-        esp_ota_abort(update_handle);
-        screenMsg("升级失败", "http init 错误");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-
-    esp_err_t perf = esp_http_client_perform(client);
-    int status = (perf == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
-    int64_t got_len = (perf == ESP_OK) ? esp_http_client_get_content_length(client) : -1;
-    esp_http_client_cleanup(client);
-
-    ESP_LOGI(TAG, "OTA: 下载结果 perf=%s status=%d written=%d content-length=%lld err=%d",
-             esp_err_to_name(perf), status, ctx.total_written,
-             (long long)got_len, (int)ctx.error);
-
-    // 4. 用户取消
-    if (ctx.cancel) {
-        ESP_LOGI(TAG, "OTA: 用户已取消下载");
-        esp_ota_abort(update_handle);
-        screenMsg("已取消升级", "设备未受影响");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        return false;
-    }
-
-    // 5. 下载失败处理
-    if (perf != ESP_OK || status < 200 || status >= 300 || ctx.error) {
-        ESP_LOGE(TAG, "OTA: 下载失败");
-        esp_ota_abort(update_handle);
-        screenMsg("升级失败", "固件下载错误");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-    if (got_len > 0 && ctx.total_written < (int)got_len) {
-        ESP_LOGE(TAG, "OTA: 固件不完整 %d / %lld", ctx.total_written, (long long)got_len);
-        esp_ota_abort(update_handle);
-        screenMsg("升级失败", "固件不完整");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-
-    // 5. 结束写入并校验
-    err = esp_ota_end(update_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA: esp_ota_end 失败: %s", esp_err_to_name(err));
-        screenMsg("升级失败", "ota_end 错误");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-
-    // 6. 切换启动分区
-    err = esp_ota_set_boot_partition(update_part);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "OTA: esp_ota_set_boot_partition 失败: %s", esp_err_to_name(err));
-        screenMsg("升级失败", "set_boot 错误");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        return false;
-    }
-
-    ESP_LOGI(TAG, "OTA: 升级完成，准备重启");
-    screenMsg("升级完成，重启中...");
-
-    // 7. 保存 last-modified 到 NVS（下次启动后据此判断是否最新）
-    nvs_handle_t h;
-    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        if (nvs_set_str(h, OTA_NVS_KEY, lastModified.c_str()) == ESP_OK) {
-            nvs_commit(h);
-            ESP_LOGI(TAG, "OTA: last-modified 已保存到 NVS");
-        }
-        nvs_close(h);
-    }
-
-    // 8. 重启
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    esp_restart();
-    return true;  // 不可达（esp_restart 不会返回）
-}
 
 // ================================================================
 // 事件循环

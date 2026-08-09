@@ -180,6 +180,22 @@ private:
     std::vector<std::string> fontList_;
     std::string bodyFontPath_;
 
+    // ---- 前光 ----
+    int brightness_ = 0;           // 前光亮度 0-100（默认 0=关闭，从配置加载）
+    int warmth_ = 50;              // 前光色温 0-100（从配置加载）
+    bool frontlightPresent_ = false;  // 上电探测结果缓存
+    void applyFrontlight();        // 应用前光亮度/色温并保存配置
+
+    // ---- 阅读浮动菜单 ----
+    bool readingMenu_ = false;     // 阅读页浮动菜单是否打开
+    void openReadingMenu();        // 打开阅读菜单
+    void closeReadingMenu();       // 关闭阅读菜单
+    void renderReadingMenu();      // 在阅读页上绘制浮动菜单
+    void handleReadingMenuTouch(int16_t x, int16_t y);  // 菜单触控
+    int layoutSel_ = -1;           // 版式选择弹窗：-1=关闭 0=行间距 1=段间距 2=首行缩进
+    void renderLayoutSelect();     // 绘制版式选择弹窗
+    void handleLayoutSelectTouch(int16_t x, int16_t y);  // 弹窗触控
+
     // ---- 屏幕渲染 ----
     void renderBootScreen(const char* subtitle);
     void splashStatus(const char* text);
@@ -190,6 +206,7 @@ private:
     void renderFontSelect();
     void renderHome();
     void renderSettings();
+    void renderFrontlightRows();   // 仅绘制设置页顶部前光两行（亮度/色温），用于局部快刷
     void renderMessageScreen(const char* l1, const char* l2 = "", const char* l3 = "");
 
     // ---- 状态栏图标 ----
@@ -221,6 +238,12 @@ private:
     void downloadAll();                                    // 下载整本
     void saveProgress();
     bool tryRestoreReading();
+    // 在线进度双向同步：服务器 > 本地 → 拉取到本地；本地 > 服务器 → 上报
+    void syncReadingProgress();
+    // 按 chapterUid 定位章节下标（当前目录优先，其次本地目录缓存）
+    int  chapterUidToIndex(const std::string& uid);
+    int  lastPushPercent_ = -1;   // 上次成功上报的进度百分比（节流用）
+    int64_t lastPushMs_    = 0;   // 上次成功上报时间 ms（节流用）
 
     // ---- 字体/版式 ----
     void loadFontList();
@@ -251,10 +274,6 @@ private:
     void handleFontTouch(int16_t x, int16_t y);
     void handleHomeTouch(int16_t x, int16_t y);
     void handleSettingsTouch(int16_t x, int16_t y);
-
-    // ---- OTA 升级 ----
-    void checkOtaUpdate();      // 设置页入口：检查并执行 OTA
-    bool performOtaUpdate(const std::string& firmwareUrl, const std::string& lastModified);
 
     // ---- 事件循环 ----
     void eventLoop();

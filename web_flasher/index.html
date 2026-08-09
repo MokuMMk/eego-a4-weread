@@ -89,6 +89,15 @@
     width: 100%; padding: 18px; font-size: 1.1rem; font-weight: 600;
     border-radius: 8px;
   }
+  select, .monitor-input {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 6px 10px; font-size: 0.8rem; outline: none;
+    font-family: inherit;
+  }
+  select:focus, .monitor-input:focus { border-color: var(--accent); }
+  .monitor-input { flex: 1; font-family: var(--mono); }
+  .monitor-console { height: 300px; }
 </style>
 </head>
 <body>
@@ -121,10 +130,35 @@
     <div class="hint" id="progress-text"></div>
   </div>
 
+  <!-- 串口监视器 -->
+  <div class="card">
+    <div class="card-title">
+      <span class="num">2</span> 串口监视器
+      <button class="btn btn-outline btn-sm" id="btn-monitor-save" style="margin-left:auto;">保存为TXT</button>
+      <button class="btn btn-outline btn-sm" id="btn-monitor-clear" style="margin-left:8px;">清屏</button>
+    </div>
+    <div class="row" style="margin-bottom:12px;">
+      <select id="monitor-baud">
+        <option>9600</option>
+        <option selected>115200</option>
+        <option>460800</option>
+        <option>921600</option>
+      </select>
+      <button class="btn btn-success btn-sm" id="btn-monitor">连接监视器</button>
+      <span class="status-badge status-disconnected" id="monitor-status">未连接</span>
+    </div>
+    <div class="console monitor-console" id="monitor-console"></div>
+    <div class="row" style="margin-top:10px;">
+      <input class="monitor-input" id="monitor-input" type="text"
+             placeholder="发送串口指令（回车发送）" autocomplete="off" />
+      <button class="btn btn-outline btn-sm" id="btn-monitor-send">发送</button>
+    </div>
+  </div>
+
   <!-- 控制台 -->
   <div class="card">
     <div class="card-title">
-      <span class="num">2</span> 控制台
+      <span class="num">3</span> 控制台
       <button class="btn btn-outline btn-sm" id="btn-clear-log" style="margin-left:auto;">清屏</button>
     </div>
     <div class="console" id="console"></div>
@@ -224,7 +258,10 @@ fetch('/firmware/papers3-weread-eegoa4.bin', { method: 'HEAD', cache: 'no-store'
     if (lm) {
       const d = new Date(lm);
       const fwTimeEl = $('fw-time');
+      // 固定用中国时区（Asia/Shanghai）显示，使在线页固件时间与设备端构建时间戳（中国本地时间）一致，
+      // 避免设备时区与在线时区不一致导致版本显示错乱。
       fwTimeEl.textContent = '固件更新时间：' + d.toLocaleString('zh-CN', {
+        timeZone: 'Asia/Shanghai',
         year: 'numeric', month: '2-digit', day: '2-digit',
         hour: '2-digit', minute: '2-digit'
       });
@@ -378,6 +415,113 @@ async function flashAll() {
 }
 
 $('btn-flash').addEventListener('click', () => flashAll());
+
+// ---- 串口监视器 ----
+let monitorPort = null;
+let monitorReader = null;
+let monitorWriter = null;
+let monitorConnected = false;
+
+const monitorConsole = $('monitor-console');
+const monitorStatus = $('monitor-status');
+
+function monitorLog(data) {
+  const span = document.createElement('span');
+  span.textContent = data;
+  monitorConsole.appendChild(span);
+  monitorConsole.scrollTop = monitorConsole.scrollHeight;
+}
+
+function setMonitorStatus(text, cls) {
+  monitorStatus.textContent = text;
+  monitorStatus.className = `status-badge ${cls}`;
+}
+
+async function monitorConnectToggle() {
+  if (monitorConnected) { await monitorDisconnect(); return; }
+  try {
+    const baud = parseInt($('monitor-baud').value, 10);
+    const existing = await navigator.serial.getPorts();
+    let p = existing.find(pp => {
+      const i = pp.getInfo();
+      return i.usbVendorId === 0x303a || i.usbProductId === 0x1001;
+    });
+    if (!p) p = await navigator.serial.requestPort();
+    await p.open({ baudRate: baud });
+    monitorPort = p;
+    monitorConnected = true;
+    monitorWriter = p.writable.getWriter();
+    monitorReader = p.readable.getReader();
+    setMonitorStatus('已连接', 'status-connected');
+    $('btn-monitor').textContent = '断开';
+    monitorLog(`--- 已连接 (${baud} baud) ---\n`);
+    readMonitorLoop(monitorReader);
+  } catch (e) {
+    monitorLog(`✗ 连接失败: ${e.message}\n`);
+    await monitorDisconnect();
+  }
+}
+
+async function readMonitorLoop(reader) {
+  const decoder = new TextDecoder();
+  try {
+    while (monitorConnected) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        monitorLog(decoder.decode(value, { stream: true }).replace(/\r/g, '\n'));
+      }
+    }
+  } catch (e) {
+    if (monitorConnected) monitorLog(`✗ 读取中断: ${e.message}\n`);
+  }
+}
+
+async function monitorDisconnect() {
+  monitorConnected = false;
+  try { if (monitorReader) { await monitorReader.cancel(); monitorReader.releaseLock(); } } catch(_) {}
+  monitorReader = null;
+  try { if (monitorWriter) { monitorWriter.releaseLock(); } } catch(_) {}
+  monitorWriter = null;
+  try { if (monitorPort) { await monitorPort.close(); } } catch(_) {}
+  monitorPort = null;
+  setMonitorStatus('未连接', 'status-disconnected');
+  $('btn-monitor').textContent = '连接监视器';
+}
+
+async function monitorSend() {
+  const text = $('monitor-input').value;
+  if (!monitorWriter || !text) return;
+  try {
+    await monitorWriter.write(new TextEncoder().encode(text + '\r\n'));
+  } catch (e) {
+    monitorLog(`✗ 发送失败: ${e.message}\n`);
+  }
+}
+
+$('btn-monitor').addEventListener('click', monitorConnectToggle);
+$('btn-monitor-send').addEventListener('click', monitorSend);
+$('monitor-input').addEventListener('keydown', e => { if (e.key === 'Enter') monitorSend(); });
+$('btn-monitor-clear').addEventListener('click', () => { monitorConsole.innerHTML = ''; });
+
+// 一键保存监视器输出为 txt
+$('btn-monitor-save').addEventListener('click', () => {
+  const text = monitorConsole.innerText;
+  if (!text.trim()) { monitorLog('（监视器为空，无内容可保存）\n'); return; }
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  a.href = url;
+  a.download = `serial_${stamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  monitorLog(`--- 已保存为 ${a.download} ---\n`);
+});
 
 // 清屏
 $('btn-clear-log').addEventListener('click', () => {

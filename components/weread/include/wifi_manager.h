@@ -32,7 +32,10 @@ public:
     WifiState connectMulti();
 
     // 连接指定 SSID/密码（阻塞）。timeout_ms 为单次连接超时（含关联+握手+DHCP）。
-    WifiState connect(const char* ssid, const char* password, uint32_t timeout_ms = 15000);
+    // bssid(channel) 用于同名多 AP/mesh 时固定到扫描到的最强实例，避免认证超时(reason=2)。
+    WifiState connect(const char* ssid, const char* password,
+                      uint32_t timeout_ms = 15000,
+                      const uint8_t* bssid = nullptr, int channel = 0);
 
     // 断开连接
     void disconnect();

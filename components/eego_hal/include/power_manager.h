@@ -22,6 +22,7 @@ public:
     void holdPower();        // GPIO4 锁存（系统启动后首项操作！）
     BatteryInfo readBattery();
     bool isCharging();
+    bool hasFrontlight() const { return lm3630aPresent_; }
 
 private:
     PowerManager() = default;

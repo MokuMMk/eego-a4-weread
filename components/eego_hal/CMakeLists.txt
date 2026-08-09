@@ -7,6 +7,7 @@ idf_component_register(
         "gslx680_touch.cpp"
         "sd_card.cpp"
         "power_manager.cpp"
+        "frontlight.cpp"
         "pcf8563_rtc.cpp"
         "buttons.cpp"
     INCLUDE_DIRS "include"

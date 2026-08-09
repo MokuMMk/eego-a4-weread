@@ -218,27 +218,16 @@ void ProvisionPortal::saveWifiConfig() {
     Config::instance().load();
     AppConfig& cfg = Config::instance().mutableGet();
 
-    // 已存在则更新，否则追加（满了替换第一个）
-    int slot = -1;
-    for (int i = 0; i < cfg.wifiCount; i++) {
-        if (strcmp(cfg.wifiList[i].ssid, provSsid_) == 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) {
-        if (cfg.wifiCount < 5) {
-            slot = cfg.wifiCount++;
-        } else {
-            slot = 0;
-        }
-    }
-    strncpy(cfg.wifiList[slot].ssid, provSsid_,
-            sizeof(cfg.wifiList[slot].ssid) - 1);
-    cfg.wifiList[slot].ssid[sizeof(cfg.wifiList[slot].ssid) - 1] = '\0';
-    strncpy(cfg.wifiList[slot].password, provPass_,
-            sizeof(cfg.wifiList[slot].password) - 1);
-    cfg.wifiList[slot].password[sizeof(cfg.wifiList[slot].password) - 1] = '\0';
+    // 重新配网时清空旧 WiFi 账号，只保留本次新配的账号，
+    // 避免旧账号残留导致连接时优先尝试已失效的网络。
+    cfg.wifiCount = 0;
+    strncpy(cfg.wifiList[0].ssid, provSsid_,
+            sizeof(cfg.wifiList[0].ssid) - 1);
+    cfg.wifiList[0].ssid[sizeof(cfg.wifiList[0].ssid) - 1] = '\0';
+    strncpy(cfg.wifiList[0].password, provPass_,
+            sizeof(cfg.wifiList[0].password) - 1);
+    cfg.wifiList[0].password[sizeof(cfg.wifiList[0].password) - 1] = '\0';
+    cfg.wifiCount = 1;
 
     Storage::instance().saveConfig(cfg);
     ESP_LOGI(TAG, "portal: wifi config saved (%s)", provSsid_);
@@ -521,10 +510,29 @@ esp_err_t ProvisionPortal::handleScan(httpd_req_t* req) {
     }
 
     cJSON* arr = cJSON_CreateArray();
+    // 同名 SSID 合并：只保留信号最强的一条，避免列表出现重复网络
     for (int i = 0; i < apNum && aps; i++) {
         if (aps[i].ssid[0] == '\0') continue;  // 跳过隐藏 SSID
+        const char* ssidName = (const char*)aps[i].ssid;
+        // 查找是否已有同名条目
+        bool merged = false;
+        int n = cJSON_GetArraySize(arr);
+        for (int j = 0; j < n; j++) {
+            cJSON* existing = cJSON_GetArrayItem(arr, j);
+            cJSON* eSsid = cJSON_GetObjectItem(existing, "ssid");
+            if (eSsid && strcmp(eSsid->valuestring, ssidName) == 0) {
+                // 已有同名：若当前信号更强则更新 rssi
+                cJSON* eRssi = cJSON_GetObjectItem(existing, "rssi");
+                if (eRssi && aps[i].rssi > eRssi->valuedouble) {
+                    cJSON_SetNumberValue(eRssi, aps[i].rssi);
+                }
+                merged = true;
+                break;
+            }
+        }
+        if (merged) continue;
         cJSON* o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "ssid", (const char*)aps[i].ssid);
+        cJSON_AddStringToObject(o, "ssid", ssidName);
         cJSON_AddNumberToObject(o, "rssi", aps[i].rssi);
         cJSON_AddBoolToObject(o, "secure", aps[i].authmode != WIFI_AUTH_OPEN);
         cJSON_AddItemToArray(arr, o);
@@ -583,7 +591,7 @@ esp_err_t ProvisionPortal::handleConnect(httpd_req_t* req) {
     wifi_config_t staCfg = {};
     strncpy((char*)staCfg.sta.ssid, ssid, sizeof(staCfg.sta.ssid) - 1);
     strncpy((char*)staCfg.sta.password, pass, sizeof(staCfg.sta.password) - 1);
-    staCfg.sta.threshold.authmode = WIFI_AUTH_OPEN;  // 兼容开放网络
+    staCfg.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;  // 支持 WPA/WPA2/WPA3 及 TKIP/AES
     esp_wifi_set_config(WIFI_IF_STA, &staCfg);
     esp_wifi_disconnect();
     esp_wifi_connect();

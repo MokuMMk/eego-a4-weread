@@ -140,6 +140,14 @@ bool Config::loadInto(AppConfig& out) {
     }
     out.fontSize          = jInt(root, "font_size", 26);
 
+    // 前光亮度/色温（0-100）— 默认关闭（亮度 0），用户手动调节后保存
+    out.brightness        = jInt(root, "brightness", 0);
+    out.warmth            = jInt(root, "warmth", 50);
+    if (out.brightness < 0) out.brightness = 0;
+    if (out.brightness > 100) out.brightness = 100;
+    if (out.warmth < 0) out.warmth = 0;
+    if (out.warmth > 100) out.warmth = 100;
+
     cJSON_Delete(root);
     return true;
 }
@@ -152,6 +160,8 @@ bool Config::load() {
     config_.firstLineIndent  = 2;     // 2 字符缩进
     config_.showImages       = true;
     config_.fontSize         = 26;
+    config_.brightness       = 0;
+    config_.warmth           = 50;
 
     if (!loadInto(config_)) {
         // 文件不存在/解析失败：保留默认值，标记已加载
@@ -229,6 +239,10 @@ bool Config::save() {
     setNum(root, "para_indent", config_.firstLineIndent);
     setBool(root, "show_images", config_.showImages);
     setNum(root, "font_size",   config_.fontSize);
+
+    // 前光亮度/色温
+    setNum(root, "brightness", config_.brightness);
+    setNum(root, "warmth",     config_.warmth);
 
     // 序列化并写入
     char* str = cJSON_Print(root);
